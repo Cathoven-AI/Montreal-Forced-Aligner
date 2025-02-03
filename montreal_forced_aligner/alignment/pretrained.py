@@ -59,6 +59,16 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
     ----------
     acoustic_model_path : str
         Path to acoustic model
+    dictionary_path : str
+        Path to pronunciation dictionary
+    corpus_directory : str, optional
+        Path to corpus directory, can be specified later in align() call
+    num_jobs : int
+        Number of jobs to use
+    debug : bool
+        Whether to output debug messages
+    verbose : bool
+        Whether to output verbose messages
 
     See Also
     --------
@@ -71,13 +81,20 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
     def __init__(
         self,
         acoustic_model_path: Path = None,
+        dictionary_path: Path = None,
+        corpus_directory: Path = None,
         **kwargs,
     ):
         self.acoustic_model = AcousticModel(acoustic_model_path)
         kw = self.acoustic_model.parameters
         kw.update(kwargs)
+        if dictionary_path is not None:
+            kw["dictionary_path"] = dictionary_path
+        if corpus_directory is not None:
+            kw["corpus_directory"] = corpus_directory
         super().__init__(**kw)
         self.final_alignment = True
+        self._initialized = False
 
     def setup_acoustic_model(self) -> None:
         """Set up the acoustic model"""
@@ -193,7 +210,7 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
         """Setup for alignment"""
         self.ignore_empty_utterances = True
         super(PretrainedAligner, self).setup()
-        if self.initialized:
+        if self._initialized:
             return
         begin = time.time()
         try:
@@ -205,13 +222,14 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
                     "This may cause issues, run with --clean, if you hit an error."
                 )
             self.setup_acoustic_model()
-            self.load_corpus()
-            if self.excluded_pronunciation_count:
-                logger.warning(
-                    f"There were {self.excluded_pronunciation_count} pronunciations in the dictionary that "
-                    f"were ignored for containing one of {len(self.excluded_phones)} phones not present in the "
-                    f"trained acoustic model.  Please run `mfa validate` to get more details."
-                )
+            if self.corpus_directory is not None:
+                self.load_corpus()
+                if self.excluded_pronunciation_count:
+                    logger.warning(
+                        f"There were {self.excluded_pronunciation_count} pronunciations in the dictionary that "
+                        f"were ignored for containing one of {len(self.excluded_phones)} phones not present in the "
+                        f"trained acoustic model.  Please run `mfa validate` to get more details."
+                    )
             self.acoustic_model.validate(self)
             self.acoustic_model.log_details()
 
@@ -220,7 +238,7 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
                 log_kaldi_errors(e.error_logs)
                 e.update_log_file()
             raise
-        self.initialized = True
+        self._initialized = True
         logger.debug(f"Setup for alignment in {time.time() - begin:.3f} seconds")
 
     @classmethod
@@ -351,8 +369,21 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
             bulk_update(session, Utterance, update_mappings)
             session.commit()
 
-    def align(self, workflow_name=None) -> None:
-        """Run the aligner"""
+    def align(self, corpus_directory: Path = None, workflow_name=None) -> None:
+        """
+        Run the aligner
+
+        Parameters
+        ----------
+        corpus_directory : Path, optional
+            Path to corpus directory, if not specified during initialization
+        workflow_name : str, optional
+            Name for the workflow
+        """
+        if corpus_directory is not None:
+            self.corpus_directory = corpus_directory
+        if self.corpus_directory is None:
+            raise ValueError("No corpus directory specified")
         self.initialize_database()
         self.create_new_current_workflow(WorkflowType.alignment, workflow_name)
         wf = self.current_workflow
