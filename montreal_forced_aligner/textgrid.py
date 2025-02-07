@@ -26,7 +26,7 @@ from montreal_forced_aligner.data import (
     TextgridFormats,
     WordType,
 )
-from montreal_forced_aligner.db import (
+from montreal_forced_aligner.db_polars import (
     CorpusWorkflow,
     Phone,
     PhoneInterval,

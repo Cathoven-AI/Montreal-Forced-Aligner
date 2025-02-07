@@ -348,11 +348,14 @@ class SimpleTokenizer:
         if clitic_set is not None:
             self.clitic_set.update(clitic_set)
         elif clitic_markers and self.word_table is not None:
-            for i in range(self.word_table.num_symbols()):
-                w = self.word_table.find(i)
+            # for i in range(self.word_table.num_symbols()):
+            #     w = self.word_table.find(i)
+            #     if w.startswith(clitic_markers[0]) or w.endswith(clitic_markers[0]):
+            #         self.clitic_set.add(w)
+            for w in self.word_table["word"].to_list():
                 if w.startswith(clitic_markers[0]) or w.endswith(clitic_markers[0]):
                     self.clitic_set.add(w)
-
+                    
         self.grapheme_set = set()
         if grapheme_set is not None:
             self.grapheme_set.update(grapheme_set)

@@ -19,7 +19,7 @@ from montreal_forced_aligner.alignment.multiprocessing import (
     PhoneConfidenceArguments,
     PhoneConfidenceFunction,
 )
-from montreal_forced_aligner.db import CorpusWorkflow, Job, PhoneInterval, Utterance, bulk_update
+from montreal_forced_aligner.db_polars import CorpusWorkflow, Job, PhoneInterval, Utterance
 from montreal_forced_aligner.dictionary.mixins import DictionaryMixin
 from montreal_forced_aligner.exceptions import NoAlignmentsError
 from montreal_forced_aligner.utils import run_kaldi_function
@@ -242,6 +242,23 @@ class AlignMixin(DictionaryMixin):
             pass
         logger.debug(f"Compiling training graphs took {time.time() - begin:.3f} seconds")
 
+    # def get_phone_confidences(self):
+    #     if not os.path.exists(self.phone_pdf_counts_path):
+    #         logger.warning("Cannot calculate phone confidences with the current model.")
+    #         return
+    #     logger.info("Calculating phone confidences...")
+    #     begin = time.time()
+
+    #     with self.session() as session:
+    #         arguments = self.phone_confidence_arguments()
+    #         interval_update_mappings = []
+    #         for result in run_kaldi_function(
+    #             PhoneConfidenceFunction, arguments, total_count=self.num_current_utterances
+    #         ):
+    #             interval_update_mappings.extend(result)
+    #         bulk_update(session, PhoneInterval, interval_update_mappings)
+    #         session.commit()
+    #     logger.debug(f"Calculating phone confidences took {time.time() - begin:.3f} seconds")
     def get_phone_confidences(self):
         if not os.path.exists(self.phone_pdf_counts_path):
             logger.warning("Cannot calculate phone confidences with the current model.")
@@ -249,15 +266,17 @@ class AlignMixin(DictionaryMixin):
         logger.info("Calculating phone confidences...")
         begin = time.time()
 
-        with self.session() as session:
-            arguments = self.phone_confidence_arguments()
-            interval_update_mappings = []
-            for result in run_kaldi_function(
-                PhoneConfidenceFunction, arguments, total_count=self.num_current_utterances
-            ):
-                interval_update_mappings.extend(result)
-            bulk_update(session, PhoneInterval, interval_update_mappings)
-            session.commit()
+        # using the PolarsDB instance (e.g., self.db) instead of a session:
+        arguments = self.phone_confidence_arguments()
+        interval_update_mappings = []
+        for result in run_kaldi_function(
+            PhoneConfidenceFunction, arguments, total_count=self.num_current_utterances
+        ):
+            interval_update_mappings.extend(result)
+
+        # Use the PolarsDB bulk_update method to update the "phone_interval" table.
+        self.polars_db.bulk_update("phone_interval", interval_update_mappings)
+
         logger.debug(f"Calculating phone confidences took {time.time() - begin:.3f} seconds")
 
     def align_utterances(self, training=False) -> None:
@@ -303,26 +322,58 @@ class AlignMixin(DictionaryMixin):
         if not training:
             if len(update_mappings) == 0 or num_successful == 0:
                 raise NoAlignmentsError(self.num_current_utterances, self.beam, self.retry_beam)
-            with self.session() as session:
-                bulk_update(session, Utterance, update_mappings)
-                session.commit()
-                session.query(Utterance).filter(
-                    Utterance.alignment_log_likelihood != None  # noqa
-                ).update(
-                    {
-                        Utterance.alignment_log_likelihood: Utterance.alignment_log_likelihood
-                        / Utterance.num_frames
-                    },
-                    synchronize_session="fetch",
-                )
-                workflow = (
-                    session.query(CorpusWorkflow)
-                    .filter(CorpusWorkflow.current == True)  # noqa
-                    .first()
-                )
-                workflow.time_stamp = datetime.datetime.now()
-                workflow.score = log_like_sum / log_like_count
-                session.commit()
+            # with self.session() as session:
+            #     bulk_update(session, Utterance, update_mappings)
+            #     session.commit()
+            #     session.query(Utterance).filter(
+            #         Utterance.alignment_log_likelihood != None  # noqa
+            #     ).update(
+            #         {
+            #             Utterance.alignment_log_likelihood: Utterance.alignment_log_likelihood
+            #             / Utterance.num_frames
+            #         },
+            #         synchronize_session="fetch",
+            #     )
+            #     workflow = (
+            #         session.query(CorpusWorkflow)
+            #         .filter(CorpusWorkflow.current == True)  # noqa
+            #         .first()
+            #     )
+            #     workflow.time_stamp = datetime.datetime.now()
+            #     workflow.score = log_like_sum / log_like_count
+            #     session.commit()
+
+            # Update the "utterance" table using bulk_update.
+            self.db.bulk_update("utterance", update_mappings)
+
+            # Now update all utterance rows where alignment_log_likelihood is not null
+            # by replacing the value with alignment_log_likelihood/num_frames.
+            utterance_df = self.polars_db.get_table("utterance")
+            utterance_df = utterance_df.with_columns(
+                pl.when(pl.col("alignment_log_likelihood").is_not_null())
+                .then(pl.col("alignment_log_likelihood") / pl.col("num_frames"))
+                .otherwise(pl.col("alignment_log_likelihood"))
+                .alias("alignment_log_likelihood")
+            )
+            self.polars_db.replace_table("utterance", utterance_df)
+
+            # Update the current CorpusWorkflow record.
+            # Typically the "corpus_workflow" table contains one record flagged as current.
+            workflow_df = self.db.get_table("corpus_workflow")
+            updated_time_stamp = datetime.datetime.now()
+            updated_score = log_like_sum / log_like_count
+            workflow_df = workflow_df.with_columns(
+                pl.when(pl.col("current") == True)
+                .then(pl.lit(updated_time_stamp))
+                .otherwise(pl.col("time_stamp"))
+                .alias("time_stamp"),
+                pl.when(pl.col("current") == True)
+                .then(pl.lit(updated_score))
+                .otherwise(pl.col("score"))
+                .alias("score")
+            )
+            self.polars_db.replace_table("corpus_workflow", workflow_df)
+
         logger.debug(
             f"Aligned {num_successful}, errors on {num_errors}, total {num_successful + num_errors}"
         )

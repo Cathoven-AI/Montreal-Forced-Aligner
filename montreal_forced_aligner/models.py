@@ -1888,19 +1888,20 @@ class ModelManager:
         """
         if not model_name:
             return self.print_remote_models(model_type)
+        
+        # Check if the local model exists before refreshing remote models
+        if self.has_local_model(model_type, model_name):
+            logger.info(f"Local model {model_name} of type {model_type} already exists.")
+            return
+
         if not self.synced_remote:
             self.refresh_remote()
-        ignore_cache = self.ignore_cache
-        if model_name not in self.remote_models[model_type]:
-            raise RemoteModelNotFoundError(
-                model_name, model_type, sorted(self.remote_models[model_type].keys())
-            )
-        if version is None:
+
+        if not version:
             version = sorted(self.remote_models[model_type][model_name].keys())[-1]
         else:
             if not version.startswith("v"):
                 version = f"v{version}"
-            ignore_cache = True
 
         if version not in self.remote_models[model_type][model_name]:
             raise RemoteModelVersionNotFoundError(
@@ -1913,7 +1914,7 @@ class ModelManager:
         local_path = (
             MODEL_TYPES[model_type].pretrained_directory().joinpath(release.download_file_name)
         )
-        if local_path.exists() and not ignore_cache:
+        if local_path.exists():
             logger.warning(
                 f"Local version of model already exists ({local_path}). "
                 f"Use the --ignore_cache flag to force redownloading."

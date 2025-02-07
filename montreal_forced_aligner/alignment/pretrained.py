@@ -9,6 +9,7 @@ import time
 import typing
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
+import polars as pl
 
 from _kalpy.matrix import DoubleMatrix, FloatMatrix
 from kalpy.data import Segment
@@ -19,14 +20,13 @@ from sqlalchemy.orm import Session
 from montreal_forced_aligner.abc import TopLevelMfaWorker
 from montreal_forced_aligner.alignment.multiprocessing import AnalyzeTranscriptsFunction
 from montreal_forced_aligner.data import PhoneType, WorkflowType
-from montreal_forced_aligner.db import (
+from montreal_forced_aligner.db_polars import (
     CorpusWorkflow,
     Dictionary,
     Grapheme,
     Phone,
     Speaker,
     Utterance,
-    bulk_update,
 )
 from montreal_forced_aligner.exceptions import KaldiProcessingError
 from montreal_forced_aligner.helper import (
@@ -59,16 +59,6 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
     ----------
     acoustic_model_path : str
         Path to acoustic model
-    dictionary_path : str
-        Path to pronunciation dictionary
-    corpus_directory : str, optional
-        Path to corpus directory, can be specified later in align() call
-    num_jobs : int
-        Number of jobs to use
-    debug : bool
-        Whether to output debug messages
-    verbose : bool
-        Whether to output verbose messages
 
     See Also
     --------
@@ -81,23 +71,125 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
     def __init__(
         self,
         acoustic_model_path: Path = None,
-        dictionary_path: Path = None,
-        corpus_directory: Path = None,
         **kwargs,
     ):
         self.acoustic_model = AcousticModel(acoustic_model_path)
         kw = self.acoustic_model.parameters
         kw.update(kwargs)
-        if dictionary_path is not None:
-            kw["dictionary_path"] = dictionary_path
-        if corpus_directory is not None:
-            kw["corpus_directory"] = corpus_directory
         super().__init__(**kw)
         self.final_alignment = True
-        self._initialized = False
 
+    # def setup_acoustic_model(self) -> None:
+    #     """Set up the acoustic model"""
+    #     self.acoustic_model.export_model(self.working_directory)
+    #     os.makedirs(self.phones_dir, exist_ok=True)
+    #     for f in ["phones.txt", "graphemes.txt"]:
+    #         path = self.working_directory.joinpath(f)
+    #         if os.path.exists(path):
+    #             os.rename(path, os.path.join(self.phones_dir, f))
+    #     dict_info = self.acoustic_model.meta.get("dictionaries", None)
+    #     if not dict_info:
+    #         return
+    #     os.makedirs(self.dictionary_output_directory, exist_ok=True)
+    #     self.oov_word = dict_info["oov_word"]
+    #     self.silence_word = dict_info["silence_word"]
+    #     self.bracketed_word = dict_info["bracketed_word"]
+    #     self.use_g2p = dict_info["use_g2p"]
+    #     self.laughter_word = dict_info["laughter_word"]
+    #     self.clitic_marker = dict_info["clitic_marker"]
+    #     self.position_dependent_phones = dict_info["position_dependent_phones"]
+    #     if not self.use_g2p:
+    #         return
+    #     dictionary_id_cache = {}
+    #     with self.session() as session:
+    #         for speaker_id, speaker_name, dictionary_id, dict_name, path in (
+    #             session.query(
+    #                 Speaker.id, Speaker.name, Dictionary.id, Dictionary.name, Dictionary.path
+    #             )
+    #             .outerjoin(Speaker.dictionary)
+    #             .filter(Dictionary.default == False)  # noqa
+    #         ):
+    #             if speaker_id is not None:
+    #                 self._speaker_ids[speaker_name] = speaker_id
+    #             dictionary_id_cache[path] = dictionary_id
+    #             self.dictionary_lookup[dict_name] = dictionary_id
+    #         dictionary = (
+    #             session.query(Dictionary).filter(Dictionary.default == True).first()  # noqa
+    #         )
+    #         if dictionary:
+    #             self._default_dictionary_id = dictionary.id
+    #             dictionary_id_cache[dictionary.path] = self._default_dictionary_id
+    #             self.dictionary_lookup[dictionary.name] = dictionary.id
+    #         for dict_name in dict_info["names"]:
+    #             dictionary = Dictionary(
+    #                 name=dict_name,
+    #                 path=dict_name,
+    #                 phone_set_type=self.phone_set_type,
+    #                 root_temp_directory=self.dictionary_output_directory,
+    #                 position_dependent_phones=self.position_dependent_phones,
+    #                 clitic_marker=self.clitic_marker,
+    #                 default=dict_name == dict_info["default"],
+    #                 use_g2p=self.use_g2p,
+    #                 max_disambiguation_symbol=0,
+    #                 silence_word=self.silence_word,
+    #                 oov_word=self.oov_word,
+    #                 bracketed_word=self.bracketed_word,
+    #                 laughter_word=self.laughter_word,
+    #                 optional_silence_phone=self.optional_silence_phone,
+    #             )
+    #             session.add(dictionary)
+    #             session.flush()
+    #             dictionary_id_cache[dict_name] = dictionary.id
+    #             if dictionary.default:
+    #                 self._default_dictionary_id = dictionary.id
+    #             fst_path = os.path.join(self.acoustic_model.dirname, dict_name + ".fst")
+    #             if os.path.exists(fst_path):
+    #                 os.makedirs(dictionary.temp_directory, exist_ok=True)
+    #                 shutil.copyfile(fst_path, dictionary.lexicon_fst_path)
+    #             fst_path = os.path.join(self.acoustic_model.dirname, dict_name + "_align.fst")
+    #             if os.path.exists(fst_path):
+    #                 os.makedirs(dictionary.temp_directory, exist_ok=True)
+    #                 shutil.copyfile(fst_path, dictionary.align_lexicon_path)
+    #         phone_objs = []
+    #         with mfa_open(self.phone_symbol_table_path, "r") as f:
+    #             for line in f:
+    #                 line = line.strip()
+    #                 phone_label, mapping_id = line.split()
+    #                 mapping_id = int(mapping_id)
+    #                 phone_type = PhoneType.non_silence
+    #                 if phone_label.startswith("#"):
+    #                     phone_type = PhoneType.disambiguation
+    #                 elif phone_label in self.kaldi_silence_phones:
+    #                     phone_type = PhoneType.silence
+    #                 phone, pos = split_phone_position(phone_label)
+    #                 phone_objs.append(
+    #                     {
+    #                         "id": mapping_id + 1,
+    #                         "mapping_id": mapping_id,
+    #                         "phone": phone,
+    #                         "position": pos,
+    #                         "kaldi_label": phone_label,
+    #                         "phone_type": phone_type,
+    #                     }
+    #                 )
+    #         grapheme_objs = []
+    #         with mfa_open(self.grapheme_symbol_table_path, "r") as f:
+    #             for line in f:
+    #                 line = line.strip()
+    #                 grapheme, mapping_id = line.split()
+    #                 mapping_id = int(mapping_id)
+    #                 grapheme_objs.append(
+    #                     {"id": mapping_id + 1, "mapping_id": mapping_id, "grapheme": grapheme}
+    #                 )
+    #         session.bulk_insert_mappings(
+    #             Grapheme, grapheme_objs, return_defaults=False, render_nulls=True
+    #         )
+    #         session.bulk_insert_mappings(
+    #             Phone, phone_objs, return_defaults=False, render_nulls=True
+    #         )
+    #         session.commit()
     def setup_acoustic_model(self) -> None:
-        """Set up the acoustic model"""
+        """Set up the acoustic model using the Polars in‑memory database"""
         self.acoustic_model.export_model(self.working_directory)
         os.makedirs(self.phones_dir, exist_ok=True)
         for f in ["phones.txt", "graphemes.txt"]:
@@ -118,99 +210,110 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
         if not self.use_g2p:
             return
         dictionary_id_cache = {}
-        with self.session() as session:
-            for speaker_id, speaker_name, dictionary_id, dict_name, path in (
-                session.query(
-                    Speaker.id, Speaker.name, Dictionary.id, Dictionary.name, Dictionary.path
-                )
-                .outerjoin(Speaker.dictionary)
-                .filter(Dictionary.default == False)  # noqa
-            ):
-                if speaker_id is not None:
-                    self._speaker_ids[speaker_name] = speaker_id
-                dictionary_id_cache[path] = dictionary_id
-                self.dictionary_lookup[dict_name] = dictionary_id
-            dictionary = (
-                session.query(Dictionary).filter(Dictionary.default == True).first()  # noqa
-            )
-            if dictionary:
-                self._default_dictionary_id = dictionary.id
-                dictionary_id_cache[dictionary.path] = self._default_dictionary_id
-                self.dictionary_lookup[dictionary.name] = dictionary.id
-            for dict_name in dict_info["names"]:
-                dictionary = Dictionary(
-                    name=dict_name,
-                    path=dict_name,
-                    phone_set_type=self.phone_set_type,
-                    root_temp_directory=self.dictionary_output_directory,
-                    position_dependent_phones=self.position_dependent_phones,
-                    clitic_marker=self.clitic_marker,
-                    default=dict_name == dict_info["default"],
-                    use_g2p=self.use_g2p,
-                    max_disambiguation_symbol=0,
-                    silence_word=self.silence_word,
-                    oov_word=self.oov_word,
-                    bracketed_word=self.bracketed_word,
-                    laughter_word=self.laughter_word,
-                    optional_silence_phone=self.optional_silence_phone,
-                )
-                session.add(dictionary)
-                session.flush()
-                dictionary_id_cache[dict_name] = dictionary.id
-                if dictionary.default:
-                    self._default_dictionary_id = dictionary.id
-                fst_path = os.path.join(self.acoustic_model.dirname, dict_name + ".fst")
-                if os.path.exists(fst_path):
-                    os.makedirs(dictionary.temp_directory, exist_ok=True)
-                    shutil.copyfile(fst_path, dictionary.lexicon_fst_path)
-                fst_path = os.path.join(self.acoustic_model.dirname, dict_name + "_align.fst")
-                if os.path.exists(fst_path):
-                    os.makedirs(dictionary.temp_directory, exist_ok=True)
-                    shutil.copyfile(fst_path, dictionary.align_lexicon_path)
-            phone_objs = []
-            with mfa_open(self.phone_symbol_table_path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    phone_label, mapping_id = line.split()
-                    mapping_id = int(mapping_id)
-                    phone_type = PhoneType.non_silence
-                    if phone_label.startswith("#"):
-                        phone_type = PhoneType.disambiguation
-                    elif phone_label in self.kaldi_silence_phones:
-                        phone_type = PhoneType.silence
-                    phone, pos = split_phone_position(phone_label)
-                    phone_objs.append(
-                        {
-                            "id": mapping_id + 1,
-                            "mapping_id": mapping_id,
-                            "phone": phone,
-                            "position": pos,
-                            "kaldi_label": phone_label,
-                            "phone_type": phone_type,
-                        }
-                    )
-            grapheme_objs = []
-            with mfa_open(self.grapheme_symbol_table_path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    grapheme, mapping_id = line.split()
-                    mapping_id = int(mapping_id)
-                    grapheme_objs.append(
-                        {"id": mapping_id + 1, "mapping_id": mapping_id, "grapheme": grapheme}
-                    )
-            session.bulk_insert_mappings(
-                Grapheme, grapheme_objs, return_defaults=False, render_nulls=True
-            )
-            session.bulk_insert_mappings(
-                Phone, phone_objs, return_defaults=False, render_nulls=True
-            )
-            session.commit()
+
+        # Instead of a SQLAlchemy query, get the speaker and dictionary tables and perform a join.
+        speaker_df = self.polars_db.get_table("speaker")
+        dictionary_df = self.polars_db.get_table("dictionary")
+        # Perform a left join on speaker.dictionary_id == dictionary.id and filter where dictionary.default == False
+        joined = speaker_df.join(dictionary_df, left_on="dictionary_id", right_on="id", how="left")
+        joined = joined.filter(pl.col("default") == False)
+        for row in joined.iter_rows(named=True):
+            # Adjust the column names as needed—here we assume a naming convention after join.
+            speaker_id = row.get("id_left")  # speaker's id
+            speaker_name = row.get("name_left")
+            dictionary_id = row.get("id_right")
+            dict_name = row.get("name_right")
+            path = row.get("path")
+            if speaker_id is not None:
+                self._speaker_ids[speaker_name] = speaker_id
+            dictionary_id_cache[path] = dictionary_id
+            self.dictionary_lookup[dict_name] = dictionary_id
+
+        # Get the default dictionary (where default == True)
+        default_dict_df = dictionary_df.filter(pl.col("default") == True)
+        if not default_dict_df.is_empty():
+            default_dict = default_dict_df.row(0, named=True)
+            self._default_dictionary_id = default_dict["id"]
+            dictionary_id_cache[default_dict["path"]] = self._default_dictionary_id
+            self.dictionary_lookup[default_dict["name"]] = default_dict["id"]
+
+        # For each dictionary name create a new dictionary row.
+        for dict_name in dict_info["names"]:
+            new_id = self.polars_db.get_next_primary_key("dictionary")
+            is_default = (dict_name == dict_info["default"])
+            dictionary_row = {
+                "id": new_id,
+                "name": dict_name,
+                "path": dict_name,
+                "phone_set_type": self.phone_set_type,
+                "root_temp_directory": str(self.dictionary_output_directory),
+                "position_dependent_phones": self.position_dependent_phones,
+                "clitic_marker": self.clitic_marker,
+                "default": is_default,
+                "use_g2p": self.use_g2p,
+                "max_disambiguation_symbol": 0,
+                "silence_word": self.silence_word,
+                "oov_word": self.oov_word,
+                "bracketed_word": self.bracketed_word,
+                "laughter_word": self.laughter_word,
+                "optional_silence_phone": self.optional_silence_phone,
+            }
+            self.polars_db.add_row("dictionary", dictionary_row)
+            dictionary_id_cache[dict_name] = new_id
+            if is_default:
+                self._default_dictionary_id = new_id
+            fst_path = os.path.join(self.acoustic_model.dirname, dict_name + ".fst")
+            if os.path.exists(fst_path):
+                os.makedirs(self.dictionary_output_directory, exist_ok=True)
+                shutil.copyfile(fst_path, os.path.join(self.dictionary_output_directory, dict_name + ".fst"))
+            fst_path = os.path.join(self.acoustic_model.dirname, dict_name + "_align.fst")
+            if os.path.exists(fst_path):
+                os.makedirs(self.dictionary_output_directory, exist_ok=True)
+                shutil.copyfile(fst_path, os.path.join(self.dictionary_output_directory, dict_name + "_align.fst"))
+
+        # Process phone symbols.
+        phone_objs = []
+        with mfa_open(self.phone_symbol_table_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                phone_label, mapping_id = line.split()
+                mapping_id = int(mapping_id)
+                phone_type = PhoneType.non_silence
+                if phone_label.startswith("#"):
+                    phone_type = PhoneType.disambiguation
+                elif phone_label in self.kaldi_silence_phones:
+                    phone_type = PhoneType.silence
+                phone, pos = split_phone_position(phone_label)
+                phone_objs.append({
+                    "id": mapping_id + 1,
+                    "mapping_id": mapping_id,
+                    "phone": phone,
+                    "position": pos,
+                    "kaldi_label": phone_label,
+                    "phone_type": phone_type,
+                })
+        # Process grapheme symbols.
+        grapheme_objs = []
+        with mfa_open(self.grapheme_symbol_table_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                grapheme, mapping_id = line.split()
+                mapping_id = int(mapping_id)
+                grapheme_objs.append({
+                    "id": mapping_id + 1,
+                    "mapping_id": mapping_id,
+                    "grapheme": grapheme,
+                })
+        # Use the Polars DB methods to bulk insert these rows.
+        self.polars_db.add_rows("grapheme", grapheme_objs)
+        self.polars_db.add_rows("phone", phone_objs)
+
 
     def setup(self) -> None:
         """Setup for alignment"""
         self.ignore_empty_utterances = True
         super(PretrainedAligner, self).setup()
-        if self._initialized:
+        if self.initialized:
             return
         begin = time.time()
         try:
@@ -222,14 +325,15 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
                     "This may cause issues, run with --clean, if you hit an error."
                 )
             self.setup_acoustic_model()
-            if self.corpus_directory is not None:
-                self.load_corpus()
-                if self.excluded_pronunciation_count:
-                    logger.warning(
-                        f"There were {self.excluded_pronunciation_count} pronunciations in the dictionary that "
-                        f"were ignored for containing one of {len(self.excluded_phones)} phones not present in the "
-                        f"trained acoustic model.  Please run `mfa validate` to get more details."
-                    )
+            self.load_corpus()
+            for k, v in self.polars_db.tables.items():
+                print(k, v)
+            if self.excluded_pronunciation_count:
+                logger.warning(
+                    f"There were {self.excluded_pronunciation_count} pronunciations in the dictionary that "
+                    f"were ignored for containing one of {len(self.excluded_phones)} phones not present in the "
+                    f"trained acoustic model.  Please run `mfa validate` to get more details."
+                )
             self.acoustic_model.validate(self)
             self.acoustic_model.log_details()
 
@@ -238,7 +342,7 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
                 log_kaldi_errors(e.error_logs)
                 e.update_log_file()
             raise
-        self._initialized = True
+        self.initialized = True
         logger.debug(f"Setup for alignment in {time.time() - begin:.3f} seconds")
 
     @classmethod
@@ -290,28 +394,77 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
         )
         return config
 
-    def align_one_utterance(self, utterance: Utterance, session: Session) -> None:
-        """
-        Align a single utterance
+    # def align_one_utterance(self, utterance: Utterance, session: Session) -> None:
+    #     """
+    #     Align a single utterance
 
-        Parameters
-        ----------
-        utterance: :class:`~montreal_forced_aligner.db.Utterance`
-            Utterance object to align
-        session: :class:`~sqlalchemy.orm.session.Session`
-            Session to use
+    #     Parameters
+    #     ----------
+    #     utterance: :class:`~montreal_forced_aligner.db.Utterance`
+    #         Utterance object to align
+    #     session: :class:`~sqlalchemy.orm.session.Session`
+    #         Session to use
+    #     """
+    #     dictionary_id = utterance.speaker.dictionary_id
+    #     workflow = self.get_latest_workflow_run(WorkflowType.online_alignment, session)
+    #     if workflow is None:
+    #         workflow = CorpusWorkflow(
+    #             name="online_alignment",
+    #             workflow_type=WorkflowType.online_alignment,
+    #             time_stamp=datetime.datetime.now(),
+    #             working_directory=self.output_directory.joinpath("online_alignment"),
+    #         )
+    #         session.add(workflow)
+    #         session.flush()
+    #     segment = Segment(
+    #         str(utterance.file.sound_file.sound_file_path),
+    #         utterance.begin,
+    #         utterance.end,
+    #         utterance.channel,
+    #     )
+    #     cmvn_string = utterance.speaker.cmvn
+    #     cmvn = None
+    #     if cmvn_string:
+    #         cmvn = read_kaldi_object(DoubleMatrix, cmvn_string)
+    #     fmllr_string = utterance.speaker.fmllr
+    #     fmllr_trans = None
+    #     if fmllr_string:
+    #         fmllr_trans = read_kaldi_object(FloatMatrix, fmllr_string)
+
+    #     text = utterance.normalized_text
+    #     if self.use_g2p:
+    #         text = utterance.normalized_character_text
+    #     utterance_data = KalpyUtterance(segment, text, cmvn_string, fmllr_string)
+    #     ctm = align_utterance_online(
+    #         self.acoustic_model,
+    #         utterance_data,
+    #         self.lexicon_compilers[dictionary_id],
+    #         cmvn=cmvn,
+    #         fmllr_trans=fmllr_trans,
+    #         **self.align_options,
+    #     )
+    #     update_utterance_intervals(session, utterance, workflow.id, ctm)
+    
+
+    def align_one_utterance(self, utterance: Utterance) -> None:
+        """
+        Align a single utterance using the Polars database.
         """
         dictionary_id = utterance.speaker.dictionary_id
-        workflow = self.get_latest_workflow_run(WorkflowType.online_alignment, session)
+        db = self.polars_db
+        # Get or create the online alignment workflow from the Polars DB.
+        workflow = self.get_latest_workflow_run(WorkflowType.online_alignment, db)
         if workflow is None:
-            workflow = CorpusWorkflow(
-                name="online_alignment",
-                workflow_type=WorkflowType.online_alignment,
-                time_stamp=datetime.datetime.now(),
-                working_directory=self.output_directory.joinpath("online_alignment"),
-            )
-            session.add(workflow)
-            session.flush()
+            workflow_id = db.get_next_primary_key("corpus_workflow")
+            workflow = {
+                "id": workflow_id,
+                "name": "online_alignment",
+                "workflow_type": str(WorkflowType.online_alignment),
+                "time_stamp": datetime.datetime.now(),
+                "working_directory": str(self.output_directory.joinpath("online_alignment")),
+                "current": True,
+            }
+            db.add_row("corpus_workflow", workflow)
         segment = Segment(
             str(utterance.file.sound_file.sound_file_path),
             utterance.begin,
@@ -326,7 +479,6 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
         fmllr_trans = None
         if fmllr_string:
             fmllr_trans = read_kaldi_object(FloatMatrix, fmllr_string)
-
         text = utterance.normalized_text
         if self.use_g2p:
             text = utterance.normalized_character_text
@@ -339,55 +491,67 @@ class PretrainedAligner(TranscriberMixin, TopLevelMfaWorker):
             fmllr_trans=fmllr_trans,
             **self.align_options,
         )
-        update_utterance_intervals(session, utterance, workflow.id, ctm)
+        # Update the utterance intervals in the Polars database.
+        update_utterance_intervals(db, utterance, workflow["id"], ctm)
 
+    # def verify_transcripts(self, workflow_name=None) -> None:
+    #     self.initialize_database()
+    #     self.create_new_current_workflow(WorkflowType.transcript_verification, workflow_name)
+    #     wf = self.current_workflow
+    #     if wf.done:
+    #         logger.info("Transcript verification already done, skipping.")
+    #         return
+    #     self.setup()
+    #     self.write_lexicon_information(write_disambiguation=True)
+    #     super().align()
+
+    #     arguments = self.analyze_alignments_arguments()
+    #     update_mappings = []
+    #     for utt_id, word_error_rate, duration_deviation, transcript in run_kaldi_function(
+    #         AnalyzeTranscriptsFunction, arguments, total_count=self.num_current_utterances
+    #     ):
+    #         update_mappings.append(
+    #             {
+    #                 "id": utt_id,
+    #                 "word_error_rate": word_error_rate,
+    #                 "duration_deviation": duration_deviation,
+    #                 "transcription_text": transcript,
+    #             }
+    #         )
+    #     with self.session() as session:
+    #         bulk_update(session, Utterance, update_mappings)
+    #         session.commit()
+    
     def verify_transcripts(self, workflow_name=None) -> None:
         self.initialize_database()
         self.create_new_current_workflow(WorkflowType.transcript_verification, workflow_name)
         wf = self.current_workflow
-        if wf.done:
+        if getattr(wf, "done", False):
             logger.info("Transcript verification already done, skipping.")
             return
         self.setup()
         self.write_lexicon_information(write_disambiguation=True)
         super().align()
-
         arguments = self.analyze_alignments_arguments()
         update_mappings = []
         for utt_id, word_error_rate, duration_deviation, transcript in run_kaldi_function(
             AnalyzeTranscriptsFunction, arguments, total_count=self.num_current_utterances
         ):
-            update_mappings.append(
-                {
-                    "id": utt_id,
-                    "word_error_rate": word_error_rate,
-                    "duration_deviation": duration_deviation,
-                    "transcription_text": transcript,
-                }
-            )
-        with self.session() as session:
-            bulk_update(session, Utterance, update_mappings)
-            session.commit()
+            update_mappings.append({
+                "id": utt_id,
+                "word_error_rate": word_error_rate,
+                "duration_deviation": duration_deviation,
+                "transcription_text": transcript,
+            })
+        # Use the Polars bulk_update method instead of the SQLAlchemy version.
+        self.polars_db.bulk_update("utterance", update_mappings)
 
-    def align(self, corpus_directory: Path = None, workflow_name=None) -> None:
-        """
-        Run the aligner
-
-        Parameters
-        ----------
-        corpus_directory : Path, optional
-            Path to corpus directory, if not specified during initialization
-        workflow_name : str, optional
-            Name for the workflow
-        """
-        if corpus_directory is not None:
-            self.corpus_directory = corpus_directory
-        if self.corpus_directory is None:
-            raise ValueError("No corpus directory specified")
+    def align(self, workflow_name=None) -> None:
+        """Run the aligner"""
         self.initialize_database()
         self.create_new_current_workflow(WorkflowType.alignment, workflow_name)
         wf = self.current_workflow
-        if wf.done:
+        if getattr(wf, "done", False):
             logger.info("Alignment already done, skipping.")
             return
         self.setup()

@@ -9,10 +9,11 @@ import typing
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+import polars as pl
 
 from montreal_forced_aligner.abc import DatabaseMixin
 from montreal_forced_aligner.data import PhoneSetType, PhoneType, WordType
-from montreal_forced_aligner.db import Dictionary, Phone, Word
+from montreal_forced_aligner.db_polars import Dictionary, Phone, Word
 from montreal_forced_aligner.helper import mfa_open
 
 if TYPE_CHECKING:
@@ -197,10 +198,13 @@ class DictionaryMixin:
         from montreal_forced_aligner.tokenization.simple import SimpleTokenizer
 
         word_table = None
-        if hasattr(self, "session") and hasattr(self, "_default_dictionary_id"):
-            with self.session() as session:
-                d = session.get(Dictionary, self._default_dictionary_id)
-                word_table = d.word_table
+        # if hasattr(self, "session") and hasattr(self, "_default_dictionary_id"):
+        #     with self.session() as session:
+        #         d = session.get(Dictionary, self._default_dictionary_id)
+        #         word_table = d.word_table
+        if hasattr(self, "polars_db") and hasattr(self, "_default_dictionary_id"):
+            word_table = self.polars_db.get_table("word").filter(pl.col("dictionary_id") == self._default_dictionary_id)
+
         tokenizer = SimpleTokenizer(
             word_table=word_table,
             word_break_markers=self.word_break_markers,
@@ -570,23 +574,49 @@ class TemporaryDictionaryMixin(DictionaryMixin, DatabaseMixin, metaclass=abc.ABC
         self._num_words = None
         self._num_speech_words = None
 
+    # @property
+    # def num_words(self) -> int:
+    #     """Number of words (including OOVs and special symbols) in the dictionary"""
+    #     if self._num_words is None:
+    #         with self.session() as session:
+    #             self._num_words = session.query(Word).count()
+    #     return self._num_words
+
+    # @property
+    # def num_speech_words(self) -> int:
+    #     """Number of speech words in the dictionary"""
+    #     if self._num_speech_words is None:
+    #         with self.session() as session:
+    #             self._num_speech_words = (
+    #                 session.query(Word).filter(Word.word_type.in_(WordType.speech_types())).count()
+    #             )
+    #     return self._num_speech_words
     @property
     def num_words(self) -> int:
         """Number of words (including OOVs and special symbols) in the dictionary"""
         if self._num_words is None:
-            with self.session() as session:
-                self._num_words = session.query(Word).count()
+            # Retrieve the "word" table from the Polars-based database
+            df = self.polars_db.get_table("word")
+            # Optionally filter by dictionary id if property is available
+            if hasattr(self, "_default_dictionary_id"):
+                df = df.filter(pl.col("dictionary_id") == self._default_dictionary_id)
+            self._num_words = df.height
         return self._num_words
 
     @property
     def num_speech_words(self) -> int:
         """Number of speech words in the dictionary"""
         if self._num_speech_words is None:
-            with self.session() as session:
-                self._num_speech_words = (
-                    session.query(Word).filter(Word.word_type.in_(WordType.speech_types())).count()
-                )
+            # Retrieve the "word" table from the Polars database
+            df = self.polars_db.get_table("word")
+            # Optionally filter by dictionary id if available
+            if hasattr(self, "_default_dictionary_id"):
+                df = df.filter(pl.col("dictionary_id") == self._default_dictionary_id)
+            # Filter words that match speech types using the provided WordType utility
+            df = df.filter(pl.col("word_type").is_in(WordType.speech_types()))
+            self._num_speech_words = df.height
         return self._num_speech_words
+
 
     @property
     def word_boundary_int_path(self) -> Path:
@@ -884,21 +914,44 @@ class TemporaryDictionaryMixin(DictionaryMixin, DatabaseMixin, metaclass=abc.ABC
         """Path to the dictionary's topology file"""
         return self.phones_dir.joinpath("topo")
 
+    # def _write_disambig(self) -> None:
+    #     """
+    #     Write disambiguation symbols to the temporary directory
+    #     """
+    #     disambig = self.disambiguation_symbols_txt_path
+    #     disambig_int = self.disambiguation_symbols_int_path
+    #     with self.session() as session, mfa_open(disambig, "w") as outf, mfa_open(
+    #         disambig_int, "w"
+    #     ) as intf:
+    #         disambiguation_symbols = session.query(Phone.mapping_id, Phone.kaldi_label).filter(
+    #             Phone.phone_type == PhoneType.disambiguation
+    #         )
+    #         for p_id, p in disambiguation_symbols:
+    #             outf.write(f"{p}\n")
+    #             intf.write(f"{p_id}\n")
+    #     phone_disambig_path = self.phones_dir.joinpath("phone_disambig.txt")
+    #     with mfa_open(phone_disambig_path, "w") as f:
+    #         f.write(str(self.phone_mapping["#0"]))
     def _write_disambig(self) -> None:
         """
         Write disambiguation symbols to the temporary directory
         """
+
         disambig = self.disambiguation_symbols_txt_path
         disambig_int = self.disambiguation_symbols_int_path
-        with self.session() as session, mfa_open(disambig, "w") as outf, mfa_open(
-            disambig_int, "w"
-        ) as intf:
-            disambiguation_symbols = session.query(Phone.mapping_id, Phone.kaldi_label).filter(
-                Phone.phone_type == PhoneType.disambiguation
+
+        with mfa_open(disambig, "w") as outf, mfa_open(disambig_int, "w") as intf:
+            # Retrieve the phone table from the PolarsDB and filter for disambiguation symbols
+            df = (
+                self.polars_db.get_table("phone")
+                .filter(pl.col("phone_type").map_elements(lambda pt: pt == PhoneType.disambiguation, return_dtype=pl.Boolean))
+                .select(["mapping_id", "kaldi_label"])
             )
-            for p_id, p in disambiguation_symbols:
-                outf.write(f"{p}\n")
-                intf.write(f"{p_id}\n")
+            # Iterate over each row (mapping_id, kaldi_label)
+            for mapping_id, kaldi_label in df.iter_rows():
+                outf.write(f"{kaldi_label}\n")
+                intf.write(f"{mapping_id}\n")
+
         phone_disambig_path = self.phones_dir.joinpath("phone_disambig.txt")
         with mfa_open(phone_disambig_path, "w") as f:
             f.write(str(self.phone_mapping["#0"]))

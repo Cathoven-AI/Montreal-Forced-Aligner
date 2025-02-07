@@ -21,6 +21,7 @@ from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Dict, List, Optional
+import polars as pl
 
 import pywrapfst
 from _kalpy.fstext import VectorFst
@@ -42,7 +43,7 @@ from montreal_forced_aligner.data import (
     TextgridFormats,
     WorkflowType,
 )
-from montreal_forced_aligner.db import (
+from montreal_forced_aligner.db_polars import (
     CorpusWorkflow,
     Dictionary,
     File,
@@ -50,7 +51,6 @@ from montreal_forced_aligner.db import (
     SoundFile,
     Speaker,
     Utterance,
-    bulk_update,
 )
 from montreal_forced_aligner.dictionary.mixins import DictionaryMixin
 from montreal_forced_aligner.exceptions import KaldiProcessingError, ModelError
@@ -142,17 +142,96 @@ class TranscriptionEvaluationMixin:
         ser, wer, cer = self.compute_wer()
         logger.info(f"SER: {100 * ser: .2f}%, WER: {100 * wer: .2f}%, CER: {100 * cer: .2f}%")
 
+    # def save_transcription_evaluation(self, output_directory: Path) -> None:
+    #     """
+    #     Save transcription evaluation to an output directory
+
+    #     Parameters
+    #     ----------
+    #     output_directory: str
+    #         Directory to save evaluation
+    #     """
+    #     output_path = output_directory.joinpath("transcription_evaluation.csv")
+    #     with mfa_open(output_path, "w") as f, self.session() as session:
+    #         writer = csv.writer(f)
+    #         writer.writerow(
+    #             [
+    #                 "file",
+    #                 "speaker",
+    #                 "begin",
+    #                 "end",
+    #                 "duration",
+    #                 "word_count",
+    #                 "oov_count",
+    #                 "gold_transcript",
+    #                 "hypothesis",
+    #                 "WER",
+    #                 "CER",
+    #             ]
+    #         )
+    #         utterances = (
+    #             session.query(
+    #                 Speaker.name,
+    #                 File.name,
+    #                 Utterance.begin,
+    #                 Utterance.end,
+    #                 Utterance.duration,
+    #                 Utterance.normalized_text,
+    #                 Utterance.transcription_text,
+    #                 Utterance.oovs,
+    #                 Utterance.word_error_rate,
+    #                 Utterance.character_error_rate,
+    #             )
+    #             .join(Utterance.speaker)
+    #             .join(Utterance.file)
+    #             .filter(Utterance.normalized_text != None)  # noqa
+    #             .filter(Utterance.normalized_text != "")
+    #         )
+
+    #         for (
+    #             speaker,
+    #             file,
+    #             begin,
+    #             end,
+    #             duration,
+    #             text,
+    #             transcription_text,
+    #             oovs,
+    #             word_error_rate,
+    #             character_error_rate,
+    #         ) in utterances:
+    #             word_count = text.count(" ") + 1
+    #             oov_count = oovs.count(" ") + 1
+    #             writer.writerow(
+    #                 [
+    #                     file,
+    #                     speaker,
+    #                     begin,
+    #                     end,
+    #                     duration,
+    #                     word_count,
+    #                     oov_count,
+    #                     text,
+    #                     transcription_text,
+    #                     word_error_rate,
+    #                     character_error_rate,
+    #                 ]
+    #             )
     def save_transcription_evaluation(self, output_directory: Path) -> None:
         """
-        Save transcription evaluation to an output directory
+        Save transcription evaluation to an output directory using Polars DataFrames.
 
+        This version no longer creates a database session but instead accesses the in-memory
+        Polars tables via `self.db`.
+        
         Parameters
         ----------
-        output_directory: str
+        output_directory: Path
             Directory to save evaluation
         """
+
         output_path = output_directory.joinpath("transcription_evaluation.csv")
-        with mfa_open(output_path, "w") as f, self.session() as session:
+        with mfa_open(output_path, "w") as f:
             writer = csv.writer(f)
             writer.writerow(
                 [
@@ -169,183 +248,346 @@ class TranscriptionEvaluationMixin:
                     "CER",
                 ]
             )
-            utterances = (
-                session.query(
-                    Speaker.name,
-                    File.name,
-                    Utterance.begin,
-                    Utterance.end,
-                    Utterance.duration,
-                    Utterance.normalized_text,
-                    Utterance.transcription_text,
-                    Utterance.oovs,
-                    Utterance.word_error_rate,
-                    Utterance.character_error_rate,
-                )
-                .join(Utterance.speaker)
-                .join(Utterance.file)
-                .filter(Utterance.normalized_text != None)  # noqa
-                .filter(Utterance.normalized_text != "")
+
+            # Retrieve the necessary tables from the Polars database.
+            # It is assumed that self.db is an instance of PolarsDB.
+            utterance_df = self.polars_db.get_table("utterance")
+            # Filter out utterances with a missing or empty normalized_text.
+            filtered_df = utterance_df.filter(
+                pl.col("normalized_text").is_not_null() & (pl.col("normalized_text") != "")
             )
 
-            for (
-                speaker,
-                file,
-                begin,
-                end,
-                duration,
-                text,
-                transcription_text,
-                oovs,
-                word_error_rate,
-                character_error_rate,
-            ) in utterances:
-                word_count = text.count(" ") + 1
-                oov_count = oovs.count(" ") + 1
+            # Retrieve speaker and file tables and rename columns to avoid conflicts.
+            speaker_df = self.polars_db.get_table("speaker").rename({"name": "speaker_name", "id": "speaker_id"})
+            file_df = self.polars_db.get_table("file").rename({"name": "file_name", "id": "file_id"})
+
+            # Join utterance DataFrame with speaker and file information.
+            joined_df = (
+                filtered_df.join(speaker_df, left_on="speaker_id", right_on="speaker_id", how="left")
+                        .join(file_df, left_on="file_id", right_on="file_id", how="left")
+            )
+
+            # Iterate over the joined rows and write out the evaluation details.
+            for row in joined_df.to_dicts():
+                text = row.get("normalized_text", "")
+                word_count = text.count(" ") + 1 if text else 0
+                oovs = row.get("oovs", "")
+                oov_count = oovs.count(" ") + 1 if oovs else 0
                 writer.writerow(
                     [
-                        file,
-                        speaker,
-                        begin,
-                        end,
-                        duration,
+                        row.get("file_name", ""),
+                        row.get("speaker_name", ""),
+                        row.get("begin", ""),
+                        row.get("end", ""),
+                        row.get("duration", ""),
                         word_count,
                         oov_count,
-                        text,
-                        transcription_text,
-                        word_error_rate,
-                        character_error_rate,
+                        row.get("normalized_text", ""),
+                        row.get("transcription_text", ""),
+                        row.get("word_error_rate", ""),
+                        row.get("character_error_rate", ""),
                     ]
                 )
+                
+    # def compute_wer(self) -> typing.Tuple[float, float, float]:
+    #     """
+    #     Evaluates the transcripts if there are reference transcripts
 
+    #     Raises
+    #     ------
+    #     :class:`~montreal_forced_aligner.exceptions.KaldiProcessingError`
+    #         If there were any errors in running Kaldi binaries
+    #     """
+    #     if not hasattr(self, "db_engine"):
+    #         raise Exception("Must be used as part of a class with a database engine")
+    #     # Sentence-level measures
+    #     incorrect = 0
+    #     total_count = 0
+    #     # Word-level measures
+    #     total_word_edits = 0
+    #     total_word_length = 0
+
+    #     # Character-level measures
+    #     total_character_edits = 0
+    #     total_character_length = 0
+
+    #     indices = []
+    #     to_comp = []
+
+    #     update_mappings = []
+    #     with self.session() as session:
+    #         utterances = session.query(Utterance)
+    #         utterances = utterances.filter(Utterance.normalized_text != None)  # noqa
+    #         utterances = utterances.filter(Utterance.normalized_text != "")
+    #         for utt in utterances:
+    #             g = utt.normalized_text.split()
+    #             total_count += 1
+    #             total_word_length += len(g)
+    #             character_length = len("".join(g))
+    #             total_character_length += character_length
+
+    #             if not utt.transcription_text:
+    #                 incorrect += 1
+    #                 total_word_edits += len(g)
+    #                 total_character_edits += character_length
+    #                 update_mappings.append(
+    #                     {"id": utt.id, "word_error_rate": 1.0, "character_error_rate": 1.0}
+    #                 )
+    #                 continue
+
+    #             h = utt.transcription_text.split()
+    #             if g != h:
+    #                 indices.append(utt.id)
+    #                 to_comp.append((g, h))
+    #                 incorrect += 1
+    #             else:
+    #                 update_mappings.append(
+    #                     {"id": utt.id, "word_error_rate": 0.0, "character_error_rate": 0.0}
+    #                 )
+
+    #         with ThreadPool(config.NUM_JOBS) as pool:
+    #             gen = pool.starmap(score_wer, to_comp)
+    #             for i, (word_edits, word_length, character_edits, character_length) in enumerate(
+    #                 gen
+    #             ):
+    #                 utt_id = indices[i]
+    #                 update_mappings.append(
+    #                     {
+    #                         "id": utt_id,
+    #                         "word_error_rate": word_edits / word_length,
+    #                         "character_error_rate": character_edits / character_length,
+    #                     }
+    #                 )
+    #                 total_word_edits += word_edits
+    #                 total_character_edits += character_edits
+
+    #         bulk_update(session, Utterance, update_mappings)
+    #         session.commit()
+    #     ser = incorrect / total_count
+    #     wer = total_word_edits / total_word_length
+    #     cer = total_character_edits / total_character_length
+    #     return ser, wer, cer
     def compute_wer(self) -> typing.Tuple[float, float, float]:
         """
-        Evaluates the transcripts if there are reference transcripts
+        Evaluates the transcripts if there are reference transcripts, computing
+        sentence error rate (SER), word error rate (WER), and character error rate (CER).
 
+        This implementation uses the in-memory Polars database (self.db) instead of a session.
         Raises
         ------
-        :class:`~montreal_forced_aligner.exceptions.KaldiProcessingError`
-            If there were any errors in running Kaldi binaries
+        Exception
+            If self.db is not set.
         """
-        if not hasattr(self, "db_engine"):
-            raise Exception("Must be used as part of a class with a database engine")
+        
+        if not hasattr(self, "db"):
+            raise Exception("Must be used as part of a class with a PolarsDB instance available as 'db'")
+
         # Sentence-level measures
         incorrect = 0
         total_count = 0
         # Word-level measures
         total_word_edits = 0
         total_word_length = 0
-
         # Character-level measures
         total_character_edits = 0
         total_character_length = 0
 
         indices = []
         to_comp = []
-
         update_mappings = []
-        with self.session() as session:
-            utterances = session.query(Utterance)
-            utterances = utterances.filter(Utterance.normalized_text != None)  # noqa
-            utterances = utterances.filter(Utterance.normalized_text != "")
-            for utt in utterances:
-                g = utt.normalized_text.split()
-                total_count += 1
-                total_word_length += len(g)
-                character_length = len("".join(g))
-                total_character_length += character_length
 
-                if not utt.transcription_text:
-                    incorrect += 1
-                    total_word_edits += len(g)
-                    total_character_edits += character_length
-                    update_mappings.append(
-                        {"id": utt.id, "word_error_rate": 1.0, "character_error_rate": 1.0}
-                    )
-                    continue
+        # Retrieve utterance table from the Polars database
+        utterance_df = self.polars_db.get_table("utterance")
+        # Filter utterances with non-null and non-empty normalized_text
+        filtered_df = utterance_df.filter(
+            pl.col("normalized_text").is_not_null() & (pl.col("normalized_text") != "")
+        )
+        # Convert the filtered DataFrame to a list of dicts
+        utterances = filtered_df.to_dicts()
 
-                h = utt.transcription_text.split()
-                if g != h:
-                    indices.append(utt.id)
-                    to_comp.append((g, h))
-                    incorrect += 1
-                else:
-                    update_mappings.append(
-                        {"id": utt.id, "word_error_rate": 0.0, "character_error_rate": 0.0}
-                    )
+        for utt in utterances:
+            normalized_text = utt.get("normalized_text", "")
+            tokens_g = normalized_text.split()
+            total_count += 1
+            total_word_length += len(tokens_g)
+            char_length = len("".join(tokens_g))
+            total_character_length += char_length
 
-            with ThreadPool(config.NUM_JOBS) as pool:
-                gen = pool.starmap(score_wer, to_comp)
-                for i, (word_edits, word_length, character_edits, character_length) in enumerate(
-                    gen
-                ):
-                    utt_id = indices[i]
-                    update_mappings.append(
-                        {
-                            "id": utt_id,
-                            "word_error_rate": word_edits / word_length,
-                            "character_error_rate": character_edits / character_length,
-                        }
-                    )
-                    total_word_edits += word_edits
-                    total_character_edits += character_edits
+            transcription_text = utt.get("transcription_text")
+            if not transcription_text:
+                # No hypothesis was provided -- count the entire reference as errors.
+                incorrect += 1
+                total_word_edits += len(tokens_g)
+                total_character_edits += char_length
+                update_mappings.append({
+                    "id": utt["id"],
+                    "word_error_rate": 1.0,
+                    "character_error_rate": 1.0
+                })
+                continue
 
-            bulk_update(session, Utterance, update_mappings)
-            session.commit()
-        ser = incorrect / total_count
-        wer = total_word_edits / total_word_length
-        cer = total_character_edits / total_character_length
+            tokens_h = transcription_text.split()
+            if tokens_g != tokens_h:
+                indices.append(utt["id"])
+                to_comp.append((tokens_g, tokens_h))
+                incorrect += 1
+            else:
+                update_mappings.append({
+                    "id": utt["id"],
+                    "word_error_rate": 0.0,
+                    "character_error_rate": 0.0
+                })
+
+        # Use a thread pool to compute WER/CER for utterances where reference and hypothesis differ.
+        with ThreadPool(config.NUM_JOBS) as pool:
+            results = pool.starmap(score_wer, to_comp)
+            for i, (word_edits, word_length, character_edits, character_length) in enumerate(results):
+                utt_id = indices[i]
+                update_mappings.append({
+                    "id": utt_id,
+                    "word_error_rate": word_edits / word_length,
+                    "character_error_rate": character_edits / character_length,
+                })
+                total_word_edits += word_edits
+                total_character_edits += character_edits
+
+        # Update the 'utterance' table in the Polars database with the new error rates.
+        self.polars_db.bulk_update("utterance", update_mappings)
+        # In-memory operations do not need an explicit commit.
+
+        ser = incorrect / total_count if total_count > 0 else 0.0
+        wer = total_word_edits / total_word_length if total_word_length > 0 else 0.0
+        cer = total_character_edits / total_character_length if total_character_length > 0 else 0.0
+
         return ser, wer, cer
 
+    # def export_transcriptions(self) -> None:
+    #     """Export transcriptions"""
+    #     with self.session() as session:
+    #         files = session.query(File).options(
+    #             selectinload(File.utterances),
+    #             selectinload(File.speakers),
+    #             joinedload(File.sound_file, innerjoin=True).load_only(SoundFile.duration),
+    #         )
+    #         for file in files:
+    #             utterance_count = len(file.utterances)
+    #             duration = file.sound_file.duration
+
+    #             if utterance_count == 0:
+    #                 logger.debug(f"Could not find any utterances for {file.name}")
+    #             elif (
+    #                 utterance_count == 1
+    #                 and file.utterances[0].begin == 0
+    #                 and file.utterances[0].end == duration
+    #             ):
+    #                 output_format = "lab"
+    #             else:
+    #                 output_format = TextgridFormats.SHORT_TEXTGRID
+    #             output_path = construct_output_path(
+    #                 file.name,
+    #                 file.relative_path,
+    #                 self.export_output_directory,
+    #                 output_format=output_format,
+    #             )
+    #             data = file.construct_transcription_tiers()
+    #             if output_format == "lab":
+    #                 for intervals in data.values():
+    #                     with mfa_open(output_path, "w") as f:
+    #                         f.write(intervals["transcription"][0].label)
+    #             else:
+    #                 tg = textgrid.Textgrid()
+    #                 tg.minTimestamp = 0
+    #                 tg.maxTimestamp = round(duration, 5)
+    #                 for speaker in file.speakers:
+    #                     speaker = speaker.name
+    #                     intervals = data[speaker]["transcription"]
+    #                     tier = textgrid.IntervalTier(
+    #                         speaker,
+    #                         [x.to_tg_interval() for x in intervals],
+    #                         minT=0,
+    #                         maxT=round(duration, 5),
+    #                     )
+
+    #                     tg.addTier(tier)
+    #                 tg.save(output_path, includeBlankSpaces=True, format=output_format)
     def export_transcriptions(self) -> None:
-        """Export transcriptions"""
-        with self.session() as session:
-            files = session.query(File).options(
-                selectinload(File.utterances),
-                selectinload(File.speakers),
-                joinedload(File.sound_file, innerjoin=True).load_only(SoundFile.duration),
+        """Export transcriptions using the Polars-based database."""
+
+        # Retrieve the necessary tables from the PolarsDB instance.
+        file_df = self.polars_db.get_table("file")
+        utterance_df = self.polars_db.get_table("utterance")
+        sound_file_df = self.polars_db.get_table("sound_file")
+        speaker_df = self.polars_db.get_table("speaker")
+
+        # Iterate over each file record.
+        for file_dict in file_df.to_dicts():
+            # Reconstruct a File object.
+            file_obj = File.from_dict(file_dict)
+            
+            # Populate related utterances for this file by filtering the utterance table.
+            file_utterances = utterance_df.filter(pl.col("file_id") == file_obj.id).to_dicts()
+            file_obj.utterances = [Utterance.from_dict(u) for u in file_utterances]
+            
+            # Populate the associated sound file (if any) for this file.
+            sf = sound_file_df.filter(pl.col("file_id") == file_obj.id)
+            if sf.height > 0:
+                sf_dict = sf.to_dicts()[0]
+                file_obj.sound_file = SoundFile.from_dict(sf_dict)
+            else:
+                file_obj.sound_file = None
+
+            # Reconstruct speakers based on speaker_ids found in file utterances.
+            speaker_ids = {u.get("speaker_id") for u in file_utterances if u.get("speaker_id") is not None}
+            spkr_list = []
+            if speaker_ids:
+                spkr_df = speaker_df.filter(pl.col("id").is_in(list(speaker_ids)))
+                spkr_list = [Speaker.from_dict(s) for s in spkr_df.to_dicts()]
+            file_obj.speakers = spkr_list
+
+            # Determine transcription output format based on utterance count and file duration.
+            utterance_count = len(file_obj.utterances)
+            duration = file_obj.sound_file.duration if file_obj.sound_file is not None else 0
+            if utterance_count == 0:
+                logger.debug(f"Could not find any utterances for {file_obj.name}")
+                continue
+            elif (
+                utterance_count == 1
+                and file_obj.utterances[0].begin == 0
+                and file_obj.utterances[0].end == duration
+            ):
+                output_format = "lab"
+            else:
+                output_format = TextgridFormats.SHORT_TEXTGRID
+
+            output_path = construct_output_path(
+                file_obj.name,
+                file_obj.relative_path,
+                self.export_output_directory,
+                output_format=output_format,
             )
-            for file in files:
-                utterance_count = len(file.utterances)
-                duration = file.sound_file.duration
-
-                if utterance_count == 0:
-                    logger.debug(f"Could not find any utterances for {file.name}")
-                elif (
-                    utterance_count == 1
-                    and file.utterances[0].begin == 0
-                    and file.utterances[0].end == duration
-                ):
-                    output_format = "lab"
-                else:
-                    output_format = TextgridFormats.SHORT_TEXTGRID
-                output_path = construct_output_path(
-                    file.name,
-                    file.relative_path,
-                    self.export_output_directory,
-                    output_format=output_format,
-                )
-                data = file.construct_transcription_tiers()
-                if output_format == "lab":
-                    for intervals in data.values():
-                        with mfa_open(output_path, "w") as f:
-                            f.write(intervals["transcription"][0].label)
-                else:
-                    tg = textgrid.Textgrid()
-                    tg.minTimestamp = 0
-                    tg.maxTimestamp = round(duration, 5)
-                    for speaker in file.speakers:
-                        speaker = speaker.name
-                        intervals = data[speaker]["transcription"]
-                        tier = textgrid.IntervalTier(
-                            speaker,
-                            [x.to_tg_interval() for x in intervals],
-                            minT=0,
-                            maxT=round(duration, 5),
-                        )
-
-                        tg.addTier(tier)
-                    tg.save(output_path, includeBlankSpaces=True, format=output_format)
+            data = file_obj.construct_transcription_tiers()
+            if output_format == "lab":
+                # If LAB format, assume a single transcription label.
+                for intervals in data.values():
+                    with mfa_open(output_path, "w") as f:
+                        f.write(intervals["transcription"][0].label)
+            else:
+                # Otherwise, build a TextGrid.
+                tg = textgrid.Textgrid()
+                tg.minTimestamp = 0
+                tg.maxTimestamp = round(duration, 5)
+                for speaker in file_obj.speakers:
+                    speaker_name = speaker.name
+                    # Get transcription intervals for this speaker; default to empty list if not found.
+                    intervals = data.get(speaker_name, {}).get("transcription", [])
+                    tier = textgrid.IntervalTier(
+                        speaker_name,
+                        [x.to_tg_interval() for x in intervals],
+                        minT=0,
+                        maxT=round(duration, 5),
+                    )
+                    tg.addTier(tier)
+                tg.save(output_path, includeBlankSpaces=True, format=output_format)
 
 
 class TranscriberMixin(CorpusAligner, TranscriptionEvaluationMixin):
@@ -515,16 +757,63 @@ class TranscriberMixin(CorpusAligner, TranscriptionEvaluationMixin):
         procs = []
         count_paths = []
         allowed_bigrams = collections.defaultdict(set)
-        with self.session() as session, tqdm(
-            total=self.num_current_utterances, disable=config.QUIET
-        ) as pbar:
+        # with self.session() as session, tqdm(
+        #     total=self.num_current_utterances, disable=config.QUIET
+        # ) as pbar:
+        #     with mfa_open(self.phones_dir.joinpath("phone_boundaries.int"), "w") as f:
+        #         for p in session.query(Phone):
+        #             f.write(f"{p.mapping_id} singleton\n")
+        #     for j in self.jobs:
+        #         args = TrainLmArguments(
+        #             j.id,
+        #             getattr(self, "session" if config.USE_THREADING else "db_string", ""),
+        #             self.working_log_directory.joinpath(f"ngram_count.{j.id}.log"),
+        #             self.phones_dir,
+        #             self.phone_symbol_table_path,
+        #             ngram_order,
+        #             self.oov_word,
+        #         )
+        #         function = TrainPhoneLmFunction(args)
+        #         p = KaldiProcessWorker(j.id, return_queue, function, stopped)
+        #         procs.append(p)
+        #         p.start()
+        #         count_paths.append(self.phones_dir.joinpath(f"{j.id}.cnts"))
+        #     while True:
+        #         try:
+        #             result = return_queue.get(timeout=1)
+        #             if isinstance(result, Exception):
+        #                 error_dict[getattr(result, "job_name", 0)] = result
+        #                 continue
+        #             if stopped.is_set():
+        #                 continue
+        #             return_queue.task_done()
+        #         except Empty:
+        #             for proc in procs:
+        #                 if not proc.finished.is_set():
+        #                     break
+        #             else:
+        #                 break
+        #             continue
+        #         _, phones = result
+        #         phones = phones.split()
+        #         unigram_phones.update(phones)
+        #         phones = ["<s>"] + phones + ["</s>"]
+        #         for i in range(len(phones) - 1):
+        #             allowed_bigrams[phones[i]].add(phones[i + 1])
+
+        #         pbar.update(1)
+        with tqdm(total=self.num_current_utterances, disable=config.QUIET) as pbar:
+            # Write phone boundaries using the Polars-based database.
             with mfa_open(self.phones_dir.joinpath("phone_boundaries.int"), "w") as f:
-                for p in session.query(Phone):
-                    f.write(f"{p.mapping_id} singleton\n")
+                phone_df = self.polars_db.get_table("phone")
+                for p in phone_df.to_dicts():
+                    f.write(f"{p.get('mapping_id')} singleton\n")
+            
+            # Process each job using the Polars setup.
             for j in self.jobs:
                 args = TrainLmArguments(
                     j.id,
-                    getattr(self, "session" if config.USE_THREADING else "db_string", ""),
+                    getattr(self, "db_string", ""),  # Use 'db_string' instead of the session attribute.
                     self.working_log_directory.joinpath(f"ngram_count.{j.id}.log"),
                     self.phones_dir,
                     self.phone_symbol_table_path,
@@ -536,6 +825,8 @@ class TranscriberMixin(CorpusAligner, TranscriptionEvaluationMixin):
                 procs.append(p)
                 p.start()
                 count_paths.append(self.phones_dir.joinpath(f"{j.id}.cnts"))
+            
+            # Process worker results.
             while True:
                 try:
                     result = return_queue.get(timeout=1)
@@ -558,7 +849,7 @@ class TranscriberMixin(CorpusAligner, TranscriptionEvaluationMixin):
                 phones = ["<s>"] + phones + ["</s>"]
                 for i in range(len(phones) - 1):
                     allowed_bigrams[phones[i]].add(phones[i + 1])
-
+            
                 pbar.update(1)
         for p in procs:
             p.join()
@@ -673,6 +964,60 @@ class TranscriberMixin(CorpusAligner, TranscriptionEvaluationMixin):
         self.acoustic_model.export_model(self.working_directory)
         self.transcribe_utterances()
 
+    # def transcribe_utterances(self) -> None:
+    #     """
+    #     Transcribe the corpus
+
+    #     See Also
+    #     --------
+    #     :func:`~montreal_forced_aligner.transcription.multiprocessing.DecodeFunction`
+    #         Multiprocessing helper function for each job
+    #     :func:`~montreal_forced_aligner.transcription.multiprocessing.LmRescoreFunction`
+    #         Multiprocessing helper function for each job
+    #     :func:`~montreal_forced_aligner.transcription.multiprocessing.CarpaLmRescoreFunction`
+    #         Multiprocessing helper function for each job
+
+    #     Raises
+    #     ------
+    #     :class:`~montreal_forced_aligner.exceptions.KaldiProcessingError`
+    #         If there were any errors in running Kaldi binaries
+    #     """
+    #     logger.info("Beginning transcription...")
+    #     workflow = self.current_workflow
+    #     if workflow.done:
+    #         logger.info("Transcription already done, skipping!")
+    #         return
+    #     try:
+    #         if workflow.workflow_type is WorkflowType.transcription:
+    #             self.uses_speaker_adaptation = False
+
+    #         self.decode()
+    #         if workflow.workflow_type is WorkflowType.transcription:
+    #             logger.info("Performing speaker adjusted transcription...")
+    #             self.transcribe_fmllr()
+    #             self.lm_rescore()
+    #             self.carpa_lm_rescore()
+    #         self.collect_alignments()
+    #         if self.fine_tune:
+    #             self.fine_tune_alignments()
+    #         if self.evaluation_mode:
+    #             os.makedirs(self.working_log_directory, exist_ok=True)
+    #             self.evaluate_transcriptions()
+    #         with self.session() as session:
+    #             session.query(CorpusWorkflow).filter(CorpusWorkflow.id == workflow.id).update(
+    #                 {"done": True}
+    #             )
+    #             session.commit()
+    #     except Exception as e:
+    #         with self.session() as session:
+    #             session.query(CorpusWorkflow).filter(CorpusWorkflow.id == workflow.id).update(
+    #                 {"dirty": True}
+    #             )
+    #             session.commit()
+    #         if isinstance(e, KaldiProcessingError):
+    #             log_kaldi_errors(e.error_logs)
+    #             e.update_log_file()
+    #         raise
     def transcribe_utterances(self) -> None:
         """
         Transcribe the corpus
@@ -712,22 +1057,17 @@ class TranscriberMixin(CorpusAligner, TranscriptionEvaluationMixin):
             if self.evaluation_mode:
                 os.makedirs(self.working_log_directory, exist_ok=True)
                 self.evaluate_transcriptions()
-            with self.session() as session:
-                session.query(CorpusWorkflow).filter(CorpusWorkflow.id == workflow.id).update(
-                    {"done": True}
-                )
-                session.commit()
+
+            # Instead of using a session to update the workflow row, update via the PolarsDB:
+            self.polars_db.bulk_update("corpus_workflow", [{"id": workflow.id, "done": True}])
         except Exception as e:
-            with self.session() as session:
-                session.query(CorpusWorkflow).filter(CorpusWorkflow.id == workflow.id).update(
-                    {"dirty": True}
-                )
-                session.commit()
+            # Mark the workflow as dirty if an error occurs.
+            self.polars_db.bulk_update("corpus_workflow", [{"id": workflow.id, "dirty": True}])
             if isinstance(e, KaldiProcessingError):
                 log_kaldi_errors(e.error_logs)
                 e.update_log_file()
             raise
-
+        
     @property
     def transcribe_fmllr_options(self) -> MetaDict:
         """Options needed for calculating fMLLR transformations"""
@@ -769,10 +1109,13 @@ class TranscriberMixin(CorpusAligner, TranscriptionEvaluationMixin):
         ):
             log_likelihood_sum += log_likelihood
             log_likelihood_count += 1
+        # if log_likelihood_count:
+        #     with self.session() as session:
+        #         workflow.score = log_likelihood_sum / log_likelihood_count
+        #         session.commit()
         if log_likelihood_count:
-            with self.session() as session:
-                workflow.score = log_likelihood_sum / log_likelihood_count
-                session.commit()
+            workflow.score = log_likelihood_sum / log_likelihood_count
+            self.polars_db.bulk_update("corpus_workflow", [{"id": workflow.id, "score": workflow.score}])
 
     def calc_initial_fmllr(self) -> None:
         """
@@ -1089,23 +1432,44 @@ class Transcriber(TranscriberMixin, TopLevelMfaWorker):
             Per dictionary arguments for HCLG
         """
         args = []
-        with self.session() as session:
-            for d in session.query(Dictionary):
-                args.append(
-                    CreateHclgArguments(
-                        d.id,
-                        getattr(self, "session" if config.USE_THREADING else "db_string", ""),
-                        self.model_directory.joinpath("log", f"hclg.{d.id}.log"),
-                        self.lexicon_compilers[d.id],
-                        self.model_directory,
-                        self.language_model.small_arpa_path,
-                        self.language_model.medium_arpa_path,
-                        self.language_model.carpa_path,
-                        self.model_path,
-                        self.tree_path,
-                        self.hclg_options,
-                    )
+        # with self.session() as session:
+        #     for d in session.query(Dictionary):
+        #         args.append(
+        #             CreateHclgArguments(
+        #                 d.id,
+        #                 getattr(self, "session" if config.USE_THREADING else "db_string", ""),
+        #                 self.model_directory.joinpath("log", f"hclg.{d.id}.log"),
+        #                 self.lexicon_compilers[d.id],
+        #                 self.model_directory,
+        #                 self.language_model.small_arpa_path,
+        #                 self.language_model.medium_arpa_path,
+        #                 self.language_model.carpa_path,
+        #                 self.model_path,
+        #                 self.tree_path,
+        #                 self.hclg_options,
+        #             )
+        #         )
+
+        # Retrieve dictionary records from the Polars-based in-memory database.
+        dictionary_df = self.polars_db.get_table("dictionary")
+        for d in dictionary_df.to_dicts():
+            # Recreate a Dictionary object from the row data.
+            dict_obj = Dictionary.from_dict(d)
+            args.append(
+                CreateHclgArguments(
+                    dict_obj.id,
+                    getattr(self, "db_string", ""),
+                    self.model_directory.joinpath("log", f"hclg.{dict_obj.id}.log"),
+                    self.lexicon_compilers[dict_obj.id],
+                    self.model_directory,
+                    self.language_model.small_arpa_path,
+                    self.language_model.medium_arpa_path,
+                    self.language_model.carpa_path,
+                    self.model_path,
+                    self.tree_path,
+                    self.hclg_options,
                 )
+            )
         return args
 
     def create_hclgs(self) -> None:
@@ -1134,10 +1498,15 @@ class Transcriber(TranscriberMixin, TopLevelMfaWorker):
         log_dir = os.path.join(self.model_directory, "log")
         os.makedirs(log_dir, exist_ok=True)
         self.write_lexicon_information(write_disambiguation=True)
-        with self.session() as session:
-            for d in session.query(Dictionary):
-                words_path = os.path.join(self.model_directory, f"words.{d.id}.txt")
-                shutil.copyfile(d.words_symbol_path, words_path)
+        # with self.session() as session:
+        #     for d in session.query(Dictionary):
+        #         words_path = os.path.join(self.model_directory, f"words.{d.id}.txt")
+        #         shutil.copyfile(d.words_symbol_path, words_path)
+        dictionary_df = self.polars_db.get_table("dictionary")
+        for d in dictionary_df.to_dicts():
+            dict_obj = Dictionary.from_dict(d)
+            words_path = os.path.join(self.model_directory, f"words.{dict_obj.id}.txt")
+            shutil.copyfile(dict_obj.words_symbol_path, words_path)
 
         big_arpa_path = self.language_model.carpa_path
         small_arpa_path = self.language_model.small_arpa_path
@@ -1350,6 +1719,59 @@ class HuggingFaceTranscriber(
         self.setup()
         self.transcribe_utterances()
 
+    # def transcribe_utterances(self) -> None:
+    #     """
+    #     Transcribe the corpus
+
+    #     Raises
+    #     ------
+    #     :class:`~montreal_forced_aligner.exceptions.KaldiProcessingError`
+    #         If there were any errors in running Kaldi binaries
+    #     """
+    #     logger.info("Beginning transcription...")
+    #     workflow = self.current_workflow
+    #     if workflow.done:
+    #         logger.info("Transcription already done, skipping!")
+    #         return
+    #     try:
+    #         if workflow.workflow_type is WorkflowType.transcription:
+    #             self.uses_speaker_adaptation = False
+
+    #         arguments = self.transcribe_arguments()
+    #         if self.cuda:
+    #             config.update_configuration(
+    #                 {
+    #                     "USE_THREADING": True,
+    #                     # "USE_MP": False,
+    #                 }
+    #             )
+    #         update_mapping = []
+    #         with self.session() as session:
+    #             for u_id, transcript in run_kaldi_function(
+    #                 self.transcription_function, arguments, total_count=self.num_utterances
+    #             ):
+    #                 update_mapping.append({"id": u_id, "transcription_text": transcript})
+    #             if update_mapping:
+    #                 bulk_update(session, Utterance, update_mapping)
+    #                 session.commit()
+    #         if self.evaluation_mode:
+    #             os.makedirs(self.working_log_directory, exist_ok=True)
+    #             self.evaluate_transcriptions()
+    #         with self.session() as session:
+    #             session.query(CorpusWorkflow).filter(CorpusWorkflow.id == workflow.id).update(
+    #                 {"done": True}
+    #             )
+    #             session.commit()
+    #     except Exception as e:
+    #         with self.session() as session:
+    #             session.query(CorpusWorkflow).filter(CorpusWorkflow.id == workflow.id).update(
+    #                 {"dirty": True}
+    #             )
+    #             session.commit()
+    #         if isinstance(e, KaldiProcessingError):
+    #             log_kaldi_errors(e.error_logs)
+    #             e.update_log_file()
+    #         raise
     def transcribe_utterances(self) -> None:
         """
         Transcribe the corpus
@@ -1377,28 +1799,22 @@ class HuggingFaceTranscriber(
                     }
                 )
             update_mapping = []
-            with self.session() as session:
-                for u_id, transcript in run_kaldi_function(
-                    self.transcription_function, arguments, total_count=self.num_utterances
-                ):
-                    update_mapping.append({"id": u_id, "transcription_text": transcript})
-                if update_mapping:
-                    bulk_update(session, Utterance, update_mapping)
-                    session.commit()
+            # Run the Kaldi function to get transcription results.
+            for u_id, transcript in run_kaldi_function(
+                self.transcription_function, arguments, total_count=self.num_utterances
+            ):
+                update_mapping.append({"id": u_id, "transcription_text": transcript})
+            # Bulk update the utterance table with the new transcriptions.
+            if update_mapping:
+                self.polars_db.bulk_update("utterance", update_mapping)
             if self.evaluation_mode:
                 os.makedirs(self.working_log_directory, exist_ok=True)
                 self.evaluate_transcriptions()
-            with self.session() as session:
-                session.query(CorpusWorkflow).filter(CorpusWorkflow.id == workflow.id).update(
-                    {"done": True}
-                )
-                session.commit()
+            # Mark the workflow as done.
+            self.polars_db.bulk_update("corpus_workflow", [{"id": workflow.id, "done": True}])
         except Exception as e:
-            with self.session() as session:
-                session.query(CorpusWorkflow).filter(CorpusWorkflow.id == workflow.id).update(
-                    {"dirty": True}
-                )
-                session.commit()
+            # In the event of an error, mark the workflow as dirty.
+            self.polars_db.bulk_update("corpus_workflow", [{"id": workflow.id, "dirty": True}])
             if isinstance(e, KaldiProcessingError):
                 log_kaldi_errors(e.error_logs)
                 e.update_log_file()

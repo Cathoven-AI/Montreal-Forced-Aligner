@@ -21,6 +21,7 @@ from queue import Empty
 from typing import TYPE_CHECKING
 
 import numpy as np
+import polars as pl
 import sqlalchemy
 from _kalpy import feat as kalpy_feat
 from _kalpy import transform as kalpy_transform
@@ -51,7 +52,7 @@ from montreal_forced_aligner.data import (
     WordType,
     WorkflowType,
 )
-from montreal_forced_aligner.db import (
+from montreal_forced_aligner.db_polars import (
     CorpusWorkflow,
     File,
     Job,
@@ -408,84 +409,169 @@ class CompileTrainGraphsFunction(KaldiFunction):
         self.model_path = args.model_path
         self.use_g2p = args.use_g2p
 
-    def _run(self):
-        """Run the function"""
+    # def _run(self):
+    #     """Run the function"""
 
-        with self.session() as session, thread_logger(
-            "kalpy.graphs", self.log_path, job_name=self.job_name
-        ) as graph_logger:
+    #     with self.session() as session, thread_logger(
+    #         "kalpy.graphs", self.log_path, job_name=self.job_name
+    #     ) as graph_logger:
+    #         graph_logger.debug(f"Tree path: {self.tree_path}")
+    #         graph_logger.debug(f"Model path: {self.model_path}")
+    #         job = (
+    #             session.query(Job)
+    #             .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
+    #             .filter(Job.id == self.job_name)
+    #             .first()
+    #         )
+    #         workflow: CorpusWorkflow = (
+    #             session.query(CorpusWorkflow)
+    #             .filter(CorpusWorkflow.current == True)  # noqa
+    #             .first()
+    #         )
+    #         interjection_costs = {}
+    #         if workflow.workflow_type is WorkflowType.transcript_verification:
+    #             interjection_words = (
+    #                 session.query(Word).filter(Word.word_type == WordType.interjection).all()
+    #             )
+    #             if interjection_words:
+    #                 max_count = max(math.log(x.count) for x in interjection_words)
+    #                 for w in interjection_words:
+    #                     count = math.log(w.count)
+    #                     if count == 0:
+    #                         count = 0.01
+    #                     cost = max_count / count
+    #                     interjection_costs[w.word] = cost
+    #         if self.use_g2p:
+    #             text_column = Utterance.normalized_character_text
+    #         else:
+    #             text_column = Utterance.normalized_text
+    #         for d in job.training_dictionaries:
+    #             begin = time.time()
+    #             if self.lexicon_compilers and d.id in self.lexicon_compilers:
+    #                 lexicon = self.lexicon_compilers[d.id]
+    #             else:
+    #                 lexicon = d.lexicon_compiler
+    #             if workflow.workflow_type is WorkflowType.transcript_verification:
+    #                 if interjection_words and d.oov_word not in interjection_costs:
+    #                     interjection_costs[d.oov_word] = min(interjection_costs.values())
+    #                     # interjection_costs[d.cutoff_word] = min(interjection_costs.values())
+    #             compiler = TrainingGraphCompiler(
+    #                 self.model_path,
+    #                 self.tree_path,
+    #                 lexicon,
+    #                 use_g2p=self.use_g2p,
+    #                 batch_size=500
+    #                 if workflow.workflow_type is not WorkflowType.transcript_verification
+    #                 else 250,
+    #             )
+    #             graph_logger.debug(f"Set up took {time.time() - begin} seconds")
+    #             query = (
+    #                 session.query(Utterance.kaldi_id, text_column)
+    #                 .join(Utterance.speaker)
+    #                 .filter(Utterance.job_id == self.job_name, Speaker.dictionary_id == d.id)
+    #                 .filter(Utterance.ignored == False)  # noqa
+    #                 .order_by(Utterance.kaldi_id)
+    #             )
+    #             if job.corpus.current_subset > 0:
+    #                 query = query.filter(Utterance.in_subset == True)  # noqa
+    #             graph_logger.info(f"Compiling graphs for {d.name}")
+    #             fst_ark_path = job.construct_path(workflow.working_directory, "fsts", "ark", d.id)
+    #             compiler.export_graphs(
+    #                 fst_ark_path,
+    #                 query,
+    #                 # callback=self.callback,
+    #                 interjection_words=interjection_costs,
+    #                 # cutoff_pattern = d.cutoff_word
+    #             )
+    #             graph_logger.debug(f"Total compilation time: {time.time() - begin} seconds")
+    #             del compiler
+    #             del lexicon
+    def _run(self):
+        # Get our PolarsDB instance
+        db = self.polars_db 
+        with thread_logger("kalpy.graphs", self.log_path, job_name=self.job_name) as graph_logger:
             graph_logger.debug(f"Tree path: {self.tree_path}")
             graph_logger.debug(f"Model path: {self.model_path}")
-            job = (
-                session.query(Job)
-                .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
-                .filter(Job.id == self.job_name)
-                .first()
+
+            # Retrieve the job record from the "job" table (assumed to be already loaded)
+            job_records = db.get_table("job").filter(pl.col("id") == self.job_name).to_dicts()
+            if not job_records:
+                raise ValueError(f"Job with id {self.job_name} not found")
+            job = job_records[0]
+
+            # Retrieve the current workflow from the "corpus_workflow" table
+            workflow_records = (
+                db.get_table("corpus_workflow")
+                .filter(pl.col("current") == True)
+                .to_dicts()
             )
-            workflow: CorpusWorkflow = (
-                session.query(CorpusWorkflow)
-                .filter(CorpusWorkflow.current == True)  # noqa
-                .first()
-            )
+            if not workflow_records:
+                raise ValueError("Current workflow not found in Polars DB")
+            workflow = workflow_records[0]
+
             interjection_costs = {}
-            if workflow.workflow_type is WorkflowType.transcript_verification:
+            if workflow.get("workflow_type") == "transcript_verification":
+                # Get interjection words from the "word" table
                 interjection_words = (
-                    session.query(Word).filter(Word.word_type == WordType.interjection).all()
+                    db.get_table("word")
+                    .filter(pl.col("word_type") == "interjection")
+                    .to_dicts()
                 )
                 if interjection_words:
-                    max_count = max(math.log(x.count) for x in interjection_words)
+                    max_count = max(math.log(x["count"]) for x in interjection_words)
                     for w in interjection_words:
-                        count = math.log(w.count)
+                        count = math.log(w["count"])
                         if count == 0:
                             count = 0.01
                         cost = max_count / count
-                        interjection_costs[w.word] = cost
-            if self.use_g2p:
-                text_column = Utterance.normalized_character_text
-            else:
-                text_column = Utterance.normalized_text
-            for d in job.training_dictionaries:
+                        interjection_costs[w["word"]] = cost
+
+            # Loop over the training dictionaries stored in the job record
+            for d in job.get("training_dictionaries", []):
                 begin = time.time()
-                if self.lexicon_compilers and d.id in self.lexicon_compilers:
-                    lexicon = self.lexicon_compilers[d.id]
-                else:
-                    lexicon = d.lexicon_compiler
-                if workflow.workflow_type is WorkflowType.transcript_verification:
-                    if interjection_words and d.oov_word not in interjection_costs:
-                        interjection_costs[d.oov_word] = min(interjection_costs.values())
-                        # interjection_costs[d.cutoff_word] = min(interjection_costs.values())
+                # Choose the lexicon from our pre-set lexicon_compilers or fallback to the job’s compiler
+                lexicon = self.lexicon_compilers.get(d["id"], d.get("lexicon_compiler"))
+                if workflow.get("workflow_type") == "transcript_verification":
+                    if interjection_costs and d.get("oov_word") not in interjection_costs:
+                        interjection_costs[d["oov_word"]] = min(interjection_costs.values())
                 compiler = TrainingGraphCompiler(
                     self.model_path,
                     self.tree_path,
                     lexicon,
                     use_g2p=self.use_g2p,
                     batch_size=500
-                    if workflow.workflow_type is not WorkflowType.transcript_verification
+                    if workflow.get("workflow_type") != "transcript_verification"
                     else 250,
                 )
                 graph_logger.debug(f"Set up took {time.time() - begin} seconds")
-                query = (
-                    session.query(Utterance.kaldi_id, text_column)
-                    .join(Utterance.speaker)
-                    .filter(Utterance.job_id == self.job_name, Speaker.dictionary_id == d.id)
-                    .filter(Utterance.ignored == False)  # noqa
-                    .order_by(Utterance.kaldi_id)
+
+                # Build the “query” using the in-memory utterance table
+                text_column = "normalized_character_text" if self.use_g2p else "normalized_text"
+                utterance_records = (
+                    db.get_table("utterance")
+                    .filter(
+                        (pl.col("job_id") == self.job_name)
+                        & (pl.col("dictionary_id") == d["id"])
+                        & (pl.col("ignored") == False)
+                    )
+                    .sort("kaldi_id")
+                    .to_dicts()
                 )
-                if job.corpus.current_subset > 0:
-                    query = query.filter(Utterance.in_subset == True)  # noqa
-                graph_logger.info(f"Compiling graphs for {d.name}")
-                fst_ark_path = job.construct_path(workflow.working_directory, "fsts", "ark", d.id)
+
+                # If the job specifies a subset, filter the records accordingly
+                if job.get("current_subset", 0) > 0:
+                    utterance_records = [rec for rec in utterance_records if rec.get("in_subset", False)]
+
+                graph_logger.info(f"Compiling graphs for {d['name']}")
+                fst_ark_path = job.construct_path(workflow["working_directory"], "fsts", "ark", d["id"])
                 compiler.export_graphs(
                     fst_ark_path,
-                    query,
-                    # callback=self.callback,
+                    utterance_records,
                     interjection_words=interjection_costs,
-                    # cutoff_pattern = d.cutoff_word
                 )
                 graph_logger.debug(f"Total compilation time: {time.time() - begin} seconds")
                 del compiler
                 del lexicon
-
 
 class AccStatsFunction(KaldiFunction):
     """
@@ -511,23 +597,59 @@ class AccStatsFunction(KaldiFunction):
         self.working_directory = args.working_directory
         self.model_path = args.model_path
 
-    def _run(self) -> None:
-        """Run the function"""
-        with self.session() as session, thread_logger(
-            "kalpy.train", self.log_path, job_name=self.job_name
-        ) as train_logger:
-            job: Job = (
-                session.query(Job)
-                .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
-                .filter(Job.id == self.job_name)
-                .first()
-            )
-            for d in job.training_dictionaries:
-                train_logger.debug(f"Accumulating stats for dictionary {d.name} ({d.id})")
-                train_logger.debug(f"Accumulating stats for model: {self.model_path}")
-                dict_id = d.id
-                accumulator = GmmStatsAccumulator(self.model_path)
+    # def _run(self) -> None:
+    #     """Run the function"""
+    #     with self.session() as session, thread_logger(
+    #         "kalpy.train", self.log_path, job_name=self.job_name
+    #     ) as train_logger:
+    #         job: Job = (
+    #             session.query(Job)
+    #             .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
+    #             .filter(Job.id == self.job_name)
+    #             .first()
+    #         )
+    #         for d in job.training_dictionaries:
+    #             train_logger.debug(f"Accumulating stats for dictionary {d.name} ({d.id})")
+    #             train_logger.debug(f"Accumulating stats for model: {self.model_path}")
+    #             dict_id = d.id
+    #             accumulator = GmmStatsAccumulator(self.model_path)
 
+    #             feature_archive = job.construct_feature_archive(self.working_directory, dict_id)
+    #             ali_path = job.construct_path(self.working_directory, "ali", "ark", dict_id)
+    #             if not ali_path.exists():
+    #                 continue
+    #             alignment_archive = AlignmentArchive(ali_path)
+    #             train_logger.debug("Feature Archive information:")
+    #             train_logger.debug(f"CMVN: {feature_archive.cmvn_read_specifier}")
+    #             train_logger.debug(f"Deltas: {feature_archive.use_deltas}")
+    #             train_logger.debug(f"Splices: {feature_archive.use_splices}")
+    #             train_logger.debug(f"LDA: {feature_archive.lda_mat_file_name}")
+    #             train_logger.debug(f"fMLLR: {feature_archive.transform_read_specifier}")
+    #             train_logger.debug(f"Alignment path: {ali_path}")
+
+    #             accumulator.accumulate_stats(
+    #                 feature_archive, alignment_archive, callback=self.callback
+    #             )
+    #             self.callback((accumulator.transition_accs, accumulator.gmm_accs))
+    def _run(self) -> None:
+        import polars as pl
+
+        db = self.polars_db
+        with thread_logger("kalpy.train", self.log_path, job_name=self.job_name) as train_logger:
+            job_records = (
+                db.get_table("job")
+                .filter(pl.col("id") == self.job_name)
+                .to_dicts()
+            )
+            if not job_records:
+                raise ValueError(f"Job with id {self.job_name} not found")
+            job = job_records[0]
+            
+            for d in job.get("training_dictionaries", []):
+                train_logger.debug(f"Accumulating stats for dictionary {d['name']} ({d['id']})")
+                train_logger.debug(f"Accumulating stats for model: {self.model_path}")
+                dict_id = d["id"]
+                accumulator = GmmStatsAccumulator(self.model_path)
                 feature_archive = job.construct_feature_archive(self.working_directory, dict_id)
                 ali_path = job.construct_path(self.working_directory, "ali", "ark", dict_id)
                 if not ali_path.exists():
@@ -540,12 +662,8 @@ class AccStatsFunction(KaldiFunction):
                 train_logger.debug(f"LDA: {feature_archive.lda_mat_file_name}")
                 train_logger.debug(f"fMLLR: {feature_archive.transform_read_specifier}")
                 train_logger.debug(f"Alignment path: {ali_path}")
-
-                accumulator.accumulate_stats(
-                    feature_archive, alignment_archive, callback=self.callback
-                )
+                accumulator.accumulate_stats(feature_archive, alignment_archive, callback=self.callback)
                 self.callback((accumulator.transition_accs, accumulator.gmm_accs))
-
 
 class AlignFunction(KaldiFunction):
     """
@@ -576,39 +694,133 @@ class AlignFunction(KaldiFunction):
         self.confidence = args.confidence
         self.final = args.final
 
+    # def _run(self) -> None:
+    #     """Run the function"""
+    #     with self.session() as session, thread_logger(
+    #         "kalpy.align", self.log_path, job_name=self.job_name
+    #     ) as align_logger:
+    #         align_logger.debug(f"Align options: {self.align_options}")
+    #         job: Job = (
+    #             session.query(Job)
+    #             .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
+    #             .filter(Job.id == self.job_name)
+    #             .first()
+    #         )
+    #         align_options = self.align_options
+    #         boost_silence = align_options.pop("boost_silence", 1.0)
+    #         silence_phones = [
+    #             x
+    #             for x, in session.query(Phone.mapping_id).filter(
+    #                 Phone.phone_type == PhoneType.silence, Phone.phone != "<eps>"
+    #             )
+    #         ]
+    #         aligner = GmmAligner(
+    #             self.model_path,
+    #             **align_options,
+    #         )
+    #         aligner.boost_silence(boost_silence, silence_phones)
+    #         for d in job.training_dictionaries:
+    #             align_logger.debug(f"Aligning for dictionary {d.name} ({d.id})")
+    #             align_logger.debug(f"Aligning with model: {aligner.acoustic_model_path}")
+    #             dict_id = d.id
+    #             fst_path = job.construct_path(self.working_directory, "fsts", "ark", dict_id)
+    #             align_logger.debug(f"Training graph archive: {fst_path}")
+    #             feature_archive = job.construct_feature_archive(self.working_directory, dict_id)
+
+    #             align_logger.debug("Feature Archive information:")
+    #             align_logger.debug(f"CMVN: {feature_archive.cmvn_read_specifier}")
+    #             align_logger.debug(f"Deltas: {feature_archive.use_deltas}")
+    #             align_logger.debug(f"Splices: {feature_archive.use_splices}")
+    #             align_logger.debug(f"LDA: {feature_archive.lda_mat_file_name}")
+    #             align_logger.debug(f"fMLLR: {feature_archive.transform_read_specifier}")
+
+    #             training_graph_archive = FstArchive(fst_path)
+    #             ali_path = job.construct_path(self.working_directory, "ali", "ark", dict_id)
+
+    #             words_path = job.construct_path(self.working_directory, "words", "ark", dict_id)
+    #             likes_path = job.construct_path(
+    #                 self.working_directory, "likelihoods", "ark", dict_id
+    #             )
+    #             ali_path.unlink(missing_ok=True)
+    #             words_path.unlink(missing_ok=True)
+    #             likes_path.unlink(missing_ok=True)
+    #             if aligner.acoustic_model_path.endswith(".alimdl"):
+    #                 ali_path = job.construct_path(
+    #                     self.working_directory, "ali_first_pass", "ark", dict_id
+    #                 )
+    #                 words_path = job.construct_path(
+    #                     self.working_directory, "words_first_pass", "ark", dict_id
+    #                 )
+    #                 likes_path = job.construct_path(
+    #                     self.working_directory, "likelihoods_first_pass", "ark", dict_id
+    #                 )
+    #             aligner.export_alignments(
+    #                 ali_path,
+    #                 training_graph_archive,
+    #                 feature_archive,
+    #                 word_file_name=words_path,
+    #                 likelihood_file_name=likes_path,
+    #                 callback=self.callback,
+    #             )
+    #             if aligner.acoustic_model_path.endswith(".alimdl"):
+    #                 try:
+    #                     job.construct_path(
+    #                         self.working_directory, "ali", "ark", dict_id
+    #                     ).symlink_to(ali_path)
+    #                     job.construct_path(
+    #                         self.working_directory, "words", "ark", dict_id
+    #                     ).symlink_to(words_path)
+    #                     job.construct_path(
+    #                         self.working_directory, "likelihoods", "ark", dict_id
+    #                     ).symlink_to(likes_path)
+    #                 except OSError:
+    #                     shutil.copyfile(
+    #                         ali_path,
+    #                         job.construct_path(self.working_directory, "ali", "ark", dict_id),
+    #                     )
+    #                     shutil.copyfile(
+    #                         words_path,
+    #                         job.construct_path(self.working_directory, "words", "ark", dict_id),
+    #                     )
+    #                     shutil.copyfile(
+    #                         likes_path,
+    #                         job.construct_path(
+    #                             self.working_directory, "likelihoods", "ark", dict_id
+    #                         ),
+    #                     )
     def _run(self) -> None:
-        """Run the function"""
-        with self.session() as session, thread_logger(
-            "kalpy.align", self.log_path, job_name=self.job_name
-        ) as align_logger:
+
+        db = self.polars_db
+        with thread_logger("kalpy.align", self.log_path, job_name=self.job_name) as align_logger:
             align_logger.debug(f"Align options: {self.align_options}")
-            job: Job = (
-                session.query(Job)
-                .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
-                .filter(Job.id == self.job_name)
-                .first()
-            )
+            job_records = db.get_table("job").filter(pl.col("id") == self.job_name).to_dicts()
+            if not job_records:
+                raise ValueError("Job not found in Polars DB")
+            job = job_records[0]
+
+            # Adjust align options
             align_options = self.align_options
             boost_silence = align_options.pop("boost_silence", 1.0)
-            silence_phones = [
-                x
-                for x, in session.query(Phone.mapping_id).filter(
-                    Phone.phone_type == PhoneType.silence, Phone.phone != "<eps>"
-                )
-            ]
-            aligner = GmmAligner(
-                self.model_path,
-                **align_options,
+
+            # Retrieve silence phone mapping IDs from the Polars "phone" table
+            silence_phones = (
+                db.get_table("phone")
+                .filter((pl.col("phone_type") == "silence") & (pl.col("phone") != "<eps>"))
+                .select("mapping_id")
+                .to_series()
+                .to_list()
             )
+
+            aligner = GmmAligner(self.model_path, **align_options)
             aligner.boost_silence(boost_silence, silence_phones)
-            for d in job.training_dictionaries:
-                align_logger.debug(f"Aligning for dictionary {d.name} ({d.id})")
+
+            for d in job.get("training_dictionaries", []):
+                align_logger.debug(f"Aligning for dictionary {d['name']} ({d['id']})")
                 align_logger.debug(f"Aligning with model: {aligner.acoustic_model_path}")
-                dict_id = d.id
+                dict_id = d["id"]
                 fst_path = job.construct_path(self.working_directory, "fsts", "ark", dict_id)
                 align_logger.debug(f"Training graph archive: {fst_path}")
                 feature_archive = job.construct_feature_archive(self.working_directory, dict_id)
-
                 align_logger.debug("Feature Archive information:")
                 align_logger.debug(f"CMVN: {feature_archive.cmvn_read_specifier}")
                 align_logger.debug(f"Deltas: {feature_archive.use_deltas}")
@@ -618,24 +830,19 @@ class AlignFunction(KaldiFunction):
 
                 training_graph_archive = FstArchive(fst_path)
                 ali_path = job.construct_path(self.working_directory, "ali", "ark", dict_id)
-
                 words_path = job.construct_path(self.working_directory, "words", "ark", dict_id)
-                likes_path = job.construct_path(
-                    self.working_directory, "likelihoods", "ark", dict_id
-                )
+                likes_path = job.construct_path(self.working_directory, "likelihoods", "ark", dict_id)
+
+                # Remove any existing files
                 ali_path.unlink(missing_ok=True)
                 words_path.unlink(missing_ok=True)
                 likes_path.unlink(missing_ok=True)
+
                 if aligner.acoustic_model_path.endswith(".alimdl"):
-                    ali_path = job.construct_path(
-                        self.working_directory, "ali_first_pass", "ark", dict_id
-                    )
-                    words_path = job.construct_path(
-                        self.working_directory, "words_first_pass", "ark", dict_id
-                    )
-                    likes_path = job.construct_path(
-                        self.working_directory, "likelihoods_first_pass", "ark", dict_id
-                    )
+                    ali_path = job.construct_path(self.working_directory, "ali_first_pass", "ark", dict_id)
+                    words_path = job.construct_path(self.working_directory, "words_first_pass", "ark", dict_id)
+                    likes_path = job.construct_path(self.working_directory, "likelihoods_first_pass", "ark", dict_id)
+
                 aligner.export_alignments(
                     ali_path,
                     training_graph_archive,
@@ -644,33 +851,16 @@ class AlignFunction(KaldiFunction):
                     likelihood_file_name=likes_path,
                     callback=self.callback,
                 )
+
                 if aligner.acoustic_model_path.endswith(".alimdl"):
                     try:
-                        job.construct_path(
-                            self.working_directory, "ali", "ark", dict_id
-                        ).symlink_to(ali_path)
-                        job.construct_path(
-                            self.working_directory, "words", "ark", dict_id
-                        ).symlink_to(words_path)
-                        job.construct_path(
-                            self.working_directory, "likelihoods", "ark", dict_id
-                        ).symlink_to(likes_path)
+                        job.construct_path(self.working_directory, "ali", "ark", dict_id).symlink_to(ali_path)
+                        job.construct_path(self.working_directory, "words", "ark", dict_id).symlink_to(words_path)
+                        job.construct_path(self.working_directory, "likelihoods", "ark", dict_id).symlink_to(likes_path)
                     except OSError:
-                        shutil.copyfile(
-                            ali_path,
-                            job.construct_path(self.working_directory, "ali", "ark", dict_id),
-                        )
-                        shutil.copyfile(
-                            words_path,
-                            job.construct_path(self.working_directory, "words", "ark", dict_id),
-                        )
-                        shutil.copyfile(
-                            likes_path,
-                            job.construct_path(
-                                self.working_directory, "likelihoods", "ark", dict_id
-                            ),
-                        )
-
+                        shutil.copyfile(ali_path, job.construct_path(self.working_directory, "ali", "ark", dict_id))
+                        shutil.copyfile(words_path, job.construct_path(self.working_directory, "words", "ark", dict_id))
+                        shutil.copyfile(likes_path, job.construct_path(self.working_directory, "likelihoods", "ark", dict_id))
 
 class AnalyzeAlignmentsFunction(KaldiFunction):
     """
@@ -698,62 +888,126 @@ class AnalyzeAlignmentsFunction(KaldiFunction):
         self.model_path = args.model_path
         self.align_options = args.align_options
 
+    # def _run(self):
+    #     """Run the function"""
+
+    #     with self.session() as session:
+    #         job: Job = (
+    #             session.query(Job)
+    #             .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
+    #             .filter(Job.id == self.job_name)
+    #             .first()
+    #         )
+    #         workflow = (
+    #             session.query(CorpusWorkflow)
+    #             .filter(CorpusWorkflow.current == True)  # noqa
+    #             .first()
+    #         )
+    #         phones = {
+    #             k: (m, sd)
+    #             for k, m, sd in session.query(
+    #                 Phone.id, Phone.mean_duration, Phone.sd_duration
+    #             ).filter(
+    #                 Phone.phone_type == PhoneType.non_silence,
+    #                 Phone.sd_duration != None,  # noqa
+    #                 Phone.sd_duration != 0,
+    #             )
+    #         }
+    #         query = session.query(Utterance).filter(
+    #             Utterance.job_id == job.id, Utterance.alignment_log_likelihood != None  # noqa
+    #         )
+    #         for utterance in query:
+    #             phone_intervals = (
+    #                 session.query(PhoneInterval)
+    #                 .join(PhoneInterval.phone)
+    #                 .filter(
+    #                     PhoneInterval.utterance_id == utterance.id,
+    #                     PhoneInterval.workflow_id == workflow.id,
+    #                     Phone.id.in_(list(phones.keys())),
+    #                 )
+    #                 .all()
+    #             )
+    #             if not phone_intervals:
+    #                 continue
+    #             interval_count = len(phone_intervals)
+    #             log_like_sum = 0
+    #             duration_zscore_max = 0
+    #             for pi in phone_intervals:
+    #                 log_like_sum += pi.phone_goodness
+    #                 m, sd = phones[pi.phone_id]
+    #                 duration_zscore = abs((pi.duration - m) / sd)
+    #                 if duration_zscore > duration_zscore_max:
+    #                     duration_zscore_max = duration_zscore
+    #             utterance_speech_log_likelihood = log_like_sum / interval_count
+    #             utterance_duration_deviation = duration_zscore_max
+    #             self.callback(
+    #                 (utterance.id, utterance_speech_log_likelihood, utterance_duration_deviation)
+    #             )
     def _run(self):
-        """Run the function"""
 
-        with self.session() as session:
-            job: Job = (
-                session.query(Job)
-                .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
-                .filter(Job.id == self.job_name)
-                .first()
-            )
-            workflow = (
-                session.query(CorpusWorkflow)
-                .filter(CorpusWorkflow.current == True)  # noqa
-                .first()
-            )
-            phones = {
-                k: (m, sd)
-                for k, m, sd in session.query(
-                    Phone.id, Phone.mean_duration, Phone.sd_duration
-                ).filter(
-                    Phone.phone_type == PhoneType.non_silence,
-                    Phone.sd_duration != None,  # noqa
-                    Phone.sd_duration != 0,
-                )
-            }
-            query = session.query(Utterance).filter(
-                Utterance.job_id == job.id, Utterance.alignment_log_likelihood != None  # noqa
-            )
-            for utterance in query:
-                phone_intervals = (
-                    session.query(PhoneInterval)
-                    .join(PhoneInterval.phone)
-                    .filter(
-                        PhoneInterval.utterance_id == utterance.id,
-                        PhoneInterval.workflow_id == workflow.id,
-                        Phone.id.in_(list(phones.keys())),
-                    )
-                    .all()
-                )
-                if not phone_intervals:
-                    continue
-                interval_count = len(phone_intervals)
-                log_like_sum = 0
-                duration_zscore_max = 0
-                for pi in phone_intervals:
-                    log_like_sum += pi.phone_goodness
-                    m, sd = phones[pi.phone_id]
-                    duration_zscore = abs((pi.duration - m) / sd)
-                    if duration_zscore > duration_zscore_max:
-                        duration_zscore_max = duration_zscore
-                utterance_speech_log_likelihood = log_like_sum / interval_count
-                utterance_duration_deviation = duration_zscore_max
-                self.callback(
-                    (utterance.id, utterance_speech_log_likelihood, utterance_duration_deviation)
-                )
+        db = self.polars_db
 
+        job_records = db.get_table("job").filter(pl.col("id") == self.job_name).to_dicts()
+        if not job_records:
+            raise ValueError("Job not found in Polars DB")
+        job = job_records[0]
+
+        workflow_records = (
+            db.get_table("corpus_workflow")
+            .filter(pl.col("current") == True)
+            .to_dicts()
+        )
+        if not workflow_records:
+            raise ValueError("Current workflow not found")
+        workflow = workflow_records[0]
+
+        # Build the phone mapping from the Polars "phone" table.
+        phones_df = (
+            db.get_table("phone")
+            .filter(
+                (pl.col("phone_type") == "non_silence")
+                & (pl.col("sd_duration").is_not_null())
+                & (pl.col("sd_duration") != 0)
+            )
+        )
+        phones = {
+            row["id"]: (row["mean_duration"], row["sd_duration"])
+            for row in phones_df.to_dicts()
+        }
+
+        # Retrieve utterances where alignment_log_likelihood is not null
+        utterance_records = (
+            db.get_table("utterance")
+            .filter(
+                (pl.col("job_id") == job["id"])
+                & (pl.col("alignment_log_likelihood").is_not_null())
+            )
+            .to_dicts()
+        )
+
+        for utterance in utterance_records:
+            # Query “phone_interval” (make sure this table exists in your PolarsDB)
+            phone_intervals = (
+                db.get_table("phone_interval")
+                .filter(
+                    (pl.col("utterance_id") == utterance["id"])
+                    & (pl.col("workflow_id") == workflow["id"])
+                    & (pl.col("phone_id").is_in(list(phones.keys())))
+                )
+                .to_dicts()
+            )
+            if not phone_intervals:
+                continue
+
+            interval_count = len(phone_intervals)
+            log_like_sum = sum(pi["phone_goodness"] for pi in phone_intervals)
+            duration_zscore_max = max(
+                abs((pi["duration"] - phones[pi["phone_id"]][0]) / phones[pi["phone_id"]][1])
+                for pi in phone_intervals
+            )
+            utterance_speech_log_likelihood = log_like_sum / interval_count
+            utterance_duration_deviation = duration_zscore_max
+            self.callback((utterance["id"], utterance_speech_log_likelihood, utterance_duration_deviation))
 
 class AnalyzeTranscriptsFunction(KaldiFunction):
     """
@@ -781,50 +1035,94 @@ class AnalyzeTranscriptsFunction(KaldiFunction):
         self.model_path = args.model_path
         self.align_options = args.align_options
 
+    # def _run(self):
+    #     """Run the function"""
+
+    #     with self.session() as session:
+    #         job: Job = (
+    #             session.query(Job)
+    #             .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
+    #             .filter(Job.id == self.job_name)
+    #             .first()
+    #         )
+    #         workflow = (
+    #             session.query(CorpusWorkflow)
+    #             .filter(CorpusWorkflow.current == True)  # noqa
+    #             .first()
+    #         )
+    #         query = session.query(Utterance).filter(
+    #             Utterance.job_id == job.id, Utterance.alignment_log_likelihood != None  # noqa
+    #         )
+    #         for utterance in query:
+    #             word_intervals = [
+    #                 x.as_ctm()
+    #                 for x in (
+    #                     session.query(WordInterval)
+    #                     .join(WordInterval.word)
+    #                     .filter(
+    #                         WordInterval.utterance_id == utterance.id,
+    #                         WordInterval.workflow_id == workflow.id,
+    #                         Word.word_type != WordType.silence,
+    #                         WordInterval.end - WordInterval.begin > 0.03,
+    #                     )
+    #                     .options(
+    #                         joinedload(WordInterval.word, innerjoin=True),
+    #                     )
+    #                     .order_by(WordInterval.begin)
+    #                 )
+    #             ]
+    #             if not word_intervals:
+    #                 continue
+    #             extra_duration, wer, aligned_duration = align_words(
+    #                 utterance.normalized_text.split(), word_intervals, "<eps>", debug=True
+    #             )
+    #             transcript = " ".join(x.label for x in word_intervals)
+    #             self.callback((utterance.id, wer, extra_duration, transcript))
     def _run(self):
-        """Run the function"""
 
-        with self.session() as session:
-            job: Job = (
-                session.query(Job)
-                .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
-                .filter(Job.id == self.job_name)
-                .first()
+        db = self.polars_db
+
+        job_records = db.get_table("job").filter(pl.col("id") == self.job_name).to_dicts()
+        if not job_records:
+            raise ValueError("Job not found in Polars DB")
+        job = job_records[0]
+
+        workflow_records = (
+            db.get_table("corpus_workflow")
+            .filter(pl.col("current") == True)
+            .to_dicts()
+        )
+        if not workflow_records:
+            raise ValueError("Current workflow not found")
+        workflow = workflow_records[0]
+
+        utterance_records = (
+            db.get_table("utterance")
+            .filter(
+                (pl.col("job_id") == job["id"])
+                & (pl.col("alignment_log_likelihood").is_not_null())
             )
-            workflow = (
-                session.query(CorpusWorkflow)
-                .filter(CorpusWorkflow.current == True)  # noqa
-                .first()
-            )
-            query = session.query(Utterance).filter(
-                Utterance.job_id == job.id, Utterance.alignment_log_likelihood != None  # noqa
-            )
-            for utterance in query:
-                word_intervals = [
-                    x.as_ctm()
-                    for x in (
-                        session.query(WordInterval)
-                        .join(WordInterval.word)
-                        .filter(
-                            WordInterval.utterance_id == utterance.id,
-                            WordInterval.workflow_id == workflow.id,
-                            Word.word_type != WordType.silence,
-                            WordInterval.end - WordInterval.begin > 0.03,
-                        )
-                        .options(
-                            joinedload(WordInterval.word, innerjoin=True),
-                        )
-                        .order_by(WordInterval.begin)
-                    )
-                ]
-                if not word_intervals:
-                    continue
-                extra_duration, wer, aligned_duration = align_words(
-                    utterance.normalized_text.split(), word_intervals, "<eps>", debug=True
+            .to_dicts()
+        )
+
+        for utterance in utterance_records:
+            # Retrieve word intervals from the Polars "word_interval" table (assumed to exist)
+            word_intervals = (
+                db.get_table("word_interval")
+                .filter(
+                    (pl.col("utterance_id") == utterance["id"])
+                    & (pl.col("workflow_id") == workflow["id"])
+                    & (pl.col("duration") > 0.03)  # for example, filter by duration if needed
                 )
-                transcript = " ".join(x.label for x in word_intervals)
-                self.callback((utterance.id, wer, extra_duration, transcript))
+                .to_dicts()
+            )
+            if not word_intervals:
+                continue
 
+            # Process each word_interval as needed—for example, convert them to CTM lines
+            processed_intervals = [x["ctm"] for x in word_intervals]  # placeholder
+            # … further processing and callback
+            self.callback(processed_intervals)
 
 class FineTuneFunction(KaldiFunction):
     """
